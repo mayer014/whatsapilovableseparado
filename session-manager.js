@@ -1,4 +1,10 @@
-const { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, makeCacheableSignalKeyStore } = require("@whiskeysockets/baileys");
+const {
+  makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+} = require("@whiskeysockets/baileys");
 const { v4: uuidv4 } = require("uuid");
 const QRCode = require("qrcode");
 const pino = require("pino");
@@ -51,9 +57,10 @@ class SessionManager {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
 
-    // Close existing socket if any
     if (session.socket) {
-      try { session.socket.end(); } catch {}
+      try {
+        session.socket.end();
+      } catch {}
       session.socket = null;
     }
 
@@ -74,6 +81,9 @@ class SessionManager {
       },
       printQRInTerminal: false,
       generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      browser: ["ZapMassa", "Chrome", "1.0.0"],
     });
 
     session.socket = socket;
@@ -124,7 +134,6 @@ class SessionManager {
         }
       });
 
-      // Timeout: if no QR in 30s, resolve with null
       setTimeout(() => {
         if (!qrResolved) {
           qrResolved = true;
@@ -147,16 +156,21 @@ class SessionManager {
   async disconnect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
+
     if (session.socket) {
-      try { await session.socket.logout(); } catch {}
-      try { session.socket.end(); } catch {}
+      try {
+        await session.socket.logout();
+      } catch {}
+      try {
+        session.socket.end();
+      } catch {}
       session.socket = null;
     }
+
     session.status = "disconnected";
     session.phone = null;
     session.qrcode = null;
 
-    // Clean session files
     const sessionDir = path.join(SESSIONS_DIR, id);
     if (fs.existsSync(sessionDir)) {
       fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -171,50 +185,63 @@ class SessionManager {
   async sendMessage(id, { phone, message, type, mediaUrl }) {
     const session = this.sessions.get(id);
     if (!session?.socket) throw new Error("Not connected");
+    if (session.status !== "connected") throw new Error("Instance is not connected");
 
-    const jid = this._formatJid(phone);
+    const clean = String(phone || "").replace(/\D/g, "");
+    if (!clean) throw new Error("Invalid phone");
 
-    if (type === "text" || !mediaUrl) {
-      const sent = await session.socket.sendMessage(jid, { text: message });
-      return { messageId: sent.key.id };
+    console.log(`📤 Preparing send | instance=${id} | phone=${clean} | type=${type || "text"}`);
+
+    const exists = await session.socket.onWhatsApp(clean);
+    if (!exists || !exists.length || !exists[0]?.exists) {
+      throw new Error(`Number not found on WhatsApp: ${clean}`);
     }
 
-    if (type === "image") {
-      const sent = await session.socket.sendMessage(jid, {
+    const jid = exists[0].jid;
+    console.log(`📍 Resolved JID | ${jid}`);
+
+    try {
+      await session.socket.presenceSubscribe(jid);
+      await this._sleep(500);
+    } catch (err) {
+      console.log(`⚠️ presenceSubscribe failed for ${jid}: ${err.message}`);
+    }
+
+    let sent;
+
+    if (type === "text" || !mediaUrl) {
+      sent = await session.socket.sendMessage(jid, { text: message });
+    } else if (type === "image") {
+      sent = await session.socket.sendMessage(jid, {
         image: { url: mediaUrl },
         caption: message || "",
       });
-      return { messageId: sent.key.id };
-    }
-
-    if (type === "video") {
-      const sent = await session.socket.sendMessage(jid, {
+    } else if (type === "video") {
+      sent = await session.socket.sendMessage(jid, {
         video: { url: mediaUrl },
         caption: message || "",
       });
-      return { messageId: sent.key.id };
-    }
-
-    if (type === "audio") {
-      const sent = await session.socket.sendMessage(jid, {
+    } else if (type === "audio") {
+      sent = await session.socket.sendMessage(jid, {
         audio: { url: mediaUrl },
         mimetype: "audio/mp4",
         ptt: true,
       });
-      return { messageId: sent.key.id };
-    }
-
-    if (type === "document") {
-      const sent = await session.socket.sendMessage(jid, {
+    } else if (type === "document") {
+      sent = await session.socket.sendMessage(jid, {
         document: { url: mediaUrl },
         mimetype: "application/pdf",
         fileName: "document.pdf",
         caption: message || "",
       });
-      return { messageId: sent.key.id };
+    } else {
+      throw new Error(`Unsupported message type: ${type}`);
     }
 
-    throw new Error(`Unsupported message type: ${type}`);
+    const messageId = sent?.key?.id || null;
+    console.log(`✅ Message sent | instance=${id} | jid=${jid} | messageId=${messageId}`);
+
+    return { messageId, jid };
   }
 
   bulkSend(id, { folderId, phones, message, mediaUrl, type, delayMin, delayMax }) {
@@ -232,7 +259,6 @@ class SessionManager {
     };
     session.campaigns.set(folderId, campaign);
 
-    // Run in background
     (async () => {
       for (const phone of phones) {
         if (campaign.cancelled) {
@@ -253,8 +279,8 @@ class SessionManager {
           console.error(`Failed to send to ${phone}:`, err.message);
         }
 
-        // Random delay between messages
-        const delay = Math.floor(Math.random() * (delayMax - delayMin + 1) + delayMin) * 1000;
+        const delay =
+          Math.floor(Math.random() * (delayMax - delayMin + 1) + delayMin) * 1000;
         await this._sleep(delay);
       }
 
@@ -267,6 +293,7 @@ class SessionManager {
   controlCampaign(id, folderId, action) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
+
     const campaign = session.campaigns.get(folderId);
     if (!campaign) throw new Error("Campaign not found");
 
@@ -292,8 +319,10 @@ class SessionManager {
   getCampaignStatus(id, folderId) {
     const session = this.sessions.get(id);
     if (!session) return { error: "Session not found" };
+
     const campaign = session.campaigns.get(folderId);
     if (!campaign) return { error: "Campaign not found" };
+
     return {
       folderId: campaign.folderId,
       status: campaign.status,
@@ -317,12 +346,12 @@ class SessionManager {
   }
 
   _formatJid(phone) {
-    const clean = phone.replace(/\D/g, "");
+    const clean = String(phone || "").replace(/\D/g, "");
     return `${clean}@s.whatsapp.net`;
   }
 
   _sleep(ms) {
-    return new Promise((r) => setTimeout(r, ms));
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
 
