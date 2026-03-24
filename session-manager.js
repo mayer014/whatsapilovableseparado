@@ -15,7 +15,7 @@ const SESSIONS_DIR = path.join(process.cwd(), "sessions");
 
 class SessionManager {
   constructor() {
-    this.sessions = new Map(); // id -> { id, token, name, socket, status, phone, qrcode, campaigns }
+    this.sessions = new Map();
     if (!fs.existsSync(SESSIONS_DIR)) {
       fs.mkdirSync(SESSIONS_DIR, { recursive: true });
     }
@@ -47,6 +47,11 @@ class SessionManager {
       phone: null,
       qrcode: null,
       campaigns: new Map(),
+
+      // novos armazenamentos em memória
+      contacts: new Map(), // jid -> { jid, phone, name, pushName, lastMessageAt }
+      chats: new Map(),    // jid -> { jid, name, phone, lastMessage, lastMessageAt, unreadCount }
+      messages: new Map(), // jid -> [ { id, fromMe, text, timestamp, type, status, remoteJid, participant } ]
     };
 
     this.sessions.set(id, session);
@@ -82,64 +87,146 @@ class SessionManager {
       printQRInTerminal: false,
       generateHighQualityLinkPreview: false,
       markOnlineOnConnect: true,
-      syncFullHistory: false,
+      syncFullHistory: true,
       browser: ["ZapMassa", "Chrome", "1.0.0"],
     });
 
     session.socket = socket;
 
-    return new Promise((resolve, reject) => {
-      let qrResolved = false;
+    // salvar credenciais
+    socket.ev.on("creds.update", saveCreds);
 
-      socket.ev.on("creds.update", saveCreds);
+    // capturar mensagens recebidas/enviadas
+    socket.ev.on("messages.upsert", async ({ messages, type }) => {
+      try {
+        if (!messages || !Array.isArray(messages)) return;
 
-      socket.ev.on("connection.update", async (update) => {
-        const { connection, lastDisconnect, qr } = update;
+        for (const msg of messages) {
+          if (!msg.key?.remoteJid) continue;
+          if (msg.key.remoteJid === "status@broadcast") continue;
 
-        if (qr && !qrResolved) {
-          try {
-            const qrDataUrl = await QRCode.toDataURL(qr);
-            session.qrcode = qrDataUrl;
-            qrResolved = true;
-            resolve(qrDataUrl);
-          } catch (err) {
-            reject(err);
-          }
+          const remoteJid = msg.key.remoteJid;
+          const fromMe = !!msg.key.fromMe;
+          const participant = msg.key.participant || null;
+          const timestamp =
+            typeof msg.messageTimestamp === "number"
+              ? msg.messageTimestamp * 1000
+              : Date.now();
+
+          const text = this._extractMessageText(msg);
+          const messageType = this._extractMessageType(msg);
+          const contactName =
+            msg.pushName ||
+            session.contacts.get(remoteJid)?.pushName ||
+            session.contacts.get(remoteJid)?.name ||
+            this._jidToPhone(remoteJid);
+
+          this._upsertContact(session, remoteJid, {
+            jid: remoteJid,
+            phone: this._jidToPhone(remoteJid),
+            name: contactName,
+            pushName: msg.pushName || contactName,
+            lastMessageAt: timestamp,
+          });
+
+          this._appendMessage(session, remoteJid, {
+            id: msg.key.id || uuidv4(),
+            fromMe,
+            text,
+            timestamp,
+            type: messageType,
+            status: fromMe ? "sent" : "received",
+            remoteJid,
+            participant,
+          });
+
+          this._upsertChat(session, remoteJid, {
+            jid: remoteJid,
+            phone: this._jidToPhone(remoteJid),
+            name: contactName,
+            lastMessage: text || `[${messageType}]`,
+            lastMessageAt: timestamp,
+            unreadCount: fromMe
+              ? 0
+              : (session.chats.get(remoteJid)?.unreadCount || 0) + 1,
+          });
         }
+      } catch (err) {
+        console.error("messages.upsert error:", err.message);
+      }
+    });
 
-        if (connection === "open") {
-          session.status = "connected";
-          session.qrcode = null;
-          const jid = socket.user?.id;
-          if (jid) {
-            session.phone = jid.split(":")[0].split("@")[0];
-          }
-          console.log(`✅ Instance ${id} connected (${session.phone})`);
+    // atualizar contatos/chats a partir do WhatsApp
+    socket.ev.on("contacts.update", (updates) => {
+      try {
+        for (const update of updates || []) {
+          const jid = update.id;
+          if (!jid) continue;
+          const existing = session.contacts.get(jid) || {};
+          session.contacts.set(jid, {
+            jid,
+            phone: this._jidToPhone(jid),
+            name: update.notify || existing.name || this._jidToPhone(jid),
+            pushName: update.notify || existing.pushName || null,
+            lastMessageAt: existing.lastMessageAt || null,
+          });
         }
+      } catch (err) {
+        console.error("contacts.update error:", err.message);
+      }
+    });
 
-        if (connection === "close") {
-          const statusCode = lastDisconnect?.error?.output?.statusCode;
-          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+    socket.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
 
-          if (shouldReconnect) {
-            console.log(`🔄 Instance ${id} reconnecting...`);
-            session.status = "connecting";
-            setTimeout(() => this.connect(id), 3000);
-          } else {
-            session.status = "disconnected";
-            session.phone = null;
-            session.socket = null;
-            console.log(`❌ Instance ${id} logged out`);
-          }
+      if (qr) {
+        try {
+          const qrDataUrl = await QRCode.toDataURL(qr);
+          session.qrcode = qrDataUrl;
+        } catch (err) {
+          console.error("QR generation error:", err.message);
         }
-      });
+      }
 
-      setTimeout(() => {
-        if (!qrResolved) {
-          qrResolved = true;
+      if (connection === "open") {
+        session.status = "connected";
+        session.qrcode = null;
+        const jid = socket.user?.id;
+        if (jid) {
+          session.phone = jid.split(":")[0].split("@")[0];
+        }
+        console.log(`✅ Instance ${id} connected (${session.phone})`);
+      }
+
+      if (connection === "close") {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        if (shouldReconnect) {
+          console.log(`🔄 Instance ${id} reconnecting...`);
+          session.status = "connecting";
+          setTimeout(() => this.connect(id), 3000);
+        } else {
+          session.status = "disconnected";
+          session.phone = null;
+          session.socket = null;
+          console.log(`❌ Instance ${id} logged out`);
+        }
+      }
+    });
+
+    // resolve QR em até 30s
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      const timer = setInterval(() => {
+        if (session.qrcode) {
+          clearInterval(timer);
+          resolve(session.qrcode);
+        } else if (Date.now() - startedAt > 30000) {
+          clearInterval(timer);
           resolve(session.qrcode);
         }
-      }, 30000);
+      }, 500);
     });
   }
 
@@ -238,7 +325,41 @@ class SessionManager {
       throw new Error(`Unsupported message type: ${type}`);
     }
 
+    const timestamp = Date.now();
     const messageId = sent?.key?.id || null;
+    const contactName =
+      session.contacts.get(jid)?.name ||
+      session.contacts.get(jid)?.pushName ||
+      this._jidToPhone(jid);
+
+    this._upsertContact(session, jid, {
+      jid,
+      phone: this._jidToPhone(jid),
+      name: contactName,
+      pushName: contactName,
+      lastMessageAt: timestamp,
+    });
+
+    this._appendMessage(session, jid, {
+      id: messageId || uuidv4(),
+      fromMe: true,
+      text: message || "",
+      timestamp,
+      type: type || "text",
+      status: "sent",
+      remoteJid: jid,
+      participant: null,
+    });
+
+    this._upsertChat(session, jid, {
+      jid,
+      phone: this._jidToPhone(jid),
+      name: contactName,
+      lastMessage: message || `[${type || "text"}]`,
+      lastMessageAt: timestamp,
+      unreadCount: 0,
+    });
+
     console.log(`✅ Message sent | instance=${id} | jid=${jid} | messageId=${messageId}`);
 
     return { messageId, jid };
@@ -343,6 +464,113 @@ class SessionManager {
       });
     }
     return list;
+  }
+
+  // NOVOS MÉTODOS PARA LEITURA
+
+  getContacts(id) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+
+    return Array.from(session.contacts.values()).sort((a, b) => {
+      return (b.lastMessageAt || 0) - (a.lastMessageAt || 0);
+    });
+  }
+
+  getChats(id) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+
+    return Array.from(session.chats.values()).sort((a, b) => {
+      return (b.lastMessageAt || 0) - (a.lastMessageAt || 0);
+    });
+  }
+
+  getMessages(id, chatId) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+
+    return session.messages.get(chatId) || [];
+  }
+
+  markChatAsRead(id, chatId) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+
+    const chat = session.chats.get(chatId);
+    if (!chat) return { success: false, error: "Chat not found" };
+
+    chat.unreadCount = 0;
+    session.chats.set(chatId, chat);
+    return { success: true };
+  }
+
+  // HELPERS INTERNOS
+
+  _upsertContact(session, jid, data) {
+    const existing = session.contacts.get(jid) || {};
+    session.contacts.set(jid, {
+      jid,
+      phone: data.phone || existing.phone || this._jidToPhone(jid),
+      name: data.name || existing.name || this._jidToPhone(jid),
+      pushName: data.pushName || existing.pushName || null,
+      lastMessageAt: data.lastMessageAt || existing.lastMessageAt || null,
+    });
+  }
+
+  _upsertChat(session, jid, data) {
+    const existing = session.chats.get(jid) || {};
+    session.chats.set(jid, {
+      jid,
+      phone: data.phone || existing.phone || this._jidToPhone(jid),
+      name: data.name || existing.name || this._jidToPhone(jid),
+      lastMessage: data.lastMessage ?? existing.lastMessage ?? "",
+      lastMessageAt: data.lastMessageAt || existing.lastMessageAt || Date.now(),
+      unreadCount:
+        typeof data.unreadCount === "number"
+          ? data.unreadCount
+          : existing.unreadCount || 0,
+    });
+  }
+
+  _appendMessage(session, jid, message) {
+    const current = session.messages.get(jid) || [];
+    current.push(message);
+
+    // limitar histórico em memória por conversa
+    const trimmed = current.slice(-500);
+    session.messages.set(jid, trimmed);
+  }
+
+  _jidToPhone(jid) {
+    if (!jid) return "";
+    return jid.split("@")[0].split(":")[0];
+  }
+
+  _extractMessageText(msg) {
+    const m = msg.message || {};
+    return (
+      m.conversation ||
+      m.extendedTextMessage?.text ||
+      m.imageMessage?.caption ||
+      m.videoMessage?.caption ||
+      m.documentMessage?.caption ||
+      m.buttonsResponseMessage?.selectedButtonId ||
+      m.listResponseMessage?.title ||
+      m.templateButtonReplyMessage?.selectedId ||
+      ""
+    );
+  }
+
+  _extractMessageType(msg) {
+    const m = msg.message || {};
+    if (m.conversation || m.extendedTextMessage) return "text";
+    if (m.imageMessage) return "image";
+    if (m.videoMessage) return "video";
+    if (m.audioMessage) return "audio";
+    if (m.documentMessage) return "document";
+    if (m.stickerMessage) return "sticker";
+    return "unknown";
   }
 
   _formatJid(phone) {
