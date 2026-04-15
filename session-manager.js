@@ -8,7 +8,7 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const { v4: uuidv4 } = require("uuid");
-const QRCode = require("qrcode"); // ✅ IMPORTANTE
+const QRCode = require("qrcode");
 const pino = require("pino");
 const path = require("path");
 const fs = require("fs");
@@ -70,14 +70,23 @@ class SessionManager {
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
+    const logger = pino({ level: "silent" });
+
     const socket = makeWASocket({
       version,
-      logger: pino({ level: "silent" }),
+      logger,
+
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys),
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
       },
+
+      browser: ["Ubuntu", "Chrome", "20.0.04"],
+
       printQRInTerminal: false,
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: true,
     });
 
     session.socket = socket;
@@ -126,14 +135,15 @@ class SessionManager {
       }
     });
 
-    // 🔗 STATUS + QR (CORRIGIDO)
+    // 🔗 STATUS + QR + RECONNECT
     socket.ev.on("connection.update", async (update) => {
-      const { connection, qr } = update;
+      const { connection, qr, lastDisconnect } = update;
 
+      // QR como imagem
       if (qr) {
         try {
           const qrDataUrl = await QRCode.toDataURL(qr);
-          session.qrcode = qrDataUrl; // ✅ AGORA É IMAGEM
+          session.qrcode = qrDataUrl;
         } catch (err) {
           console.error("Erro ao gerar QR:", err.message);
         }
@@ -142,11 +152,22 @@ class SessionManager {
       if (connection === "open") {
         session.status = "connected";
         session.qrcode = null;
+        console.log(`✅ Conectado: ${id}`);
       }
 
       if (connection === "close") {
-        session.status = "disconnected";
-        session.socket = null;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        if (shouldReconnect) {
+          console.log(`🔄 Reconectando: ${id}`);
+          session.status = "connecting";
+          setTimeout(() => this.connect(id), 3000);
+        } else {
+          console.log(`❌ Sessão encerrada: ${id}`);
+          session.status = "disconnected";
+          session.socket = null;
+        }
       }
     });
 
@@ -160,7 +181,6 @@ class SessionManager {
           resolve(session.qrcode);
         }
 
-        // fallback 30s
         if (Date.now() - started > 30000) {
           clearInterval(timer);
           resolve(session.qrcode);
