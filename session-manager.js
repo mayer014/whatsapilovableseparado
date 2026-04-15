@@ -15,9 +15,9 @@ const fs = require("fs");
 
 const SESSIONS_DIR = path.join(process.cwd(), "sessions");
 
-// CONFIG PRO
+// CONFIG
 const MAX_MESSAGES_PER_CHAT = 500;
-const MESSAGE_TTL = 1000 * 60 * 60 * 24; // 24h
+const MESSAGE_TTL = 1000 * 60 * 60 * 24;
 const DOWNLOAD_RETRY = 2;
 
 class SessionManager {
@@ -29,7 +29,6 @@ class SessionManager {
     }
   }
 
-  // 🔑 Buscar sessão pelo token
   getByToken(token) {
     if (!token) return null;
 
@@ -40,7 +39,6 @@ class SessionManager {
     return null;
   }
 
-  // 🆕 Criar instância
   async create() {
     const id = uuidv4();
     const token = uuidv4();
@@ -62,7 +60,6 @@ class SessionManager {
     return { id, token };
   }
 
-  // 🔌 Conectar WhatsApp
   async connect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -88,7 +85,7 @@ class SessionManager {
 
     socket.ev.on("creds.update", saveCreds);
 
-    // 📩 RECEBER MENSAGENS
+    // RECEBER MENSAGENS
     socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const msg of messages) {
         if (!msg.message) continue;
@@ -118,7 +115,6 @@ class SessionManager {
         const now = Date.now();
         const filtered = trimmed.filter(m => now - m.timestamp < MESSAGE_TTL);
 
-        // limpar index antigo
         const removedIds = list
           .slice(0, list.length - filtered.length)
           .map(m => m.id);
@@ -126,14 +122,13 @@ class SessionManager {
         removedIds.forEach(id => session.messageIndex.delete(id));
 
         session.messages.set(jid, filtered);
-
         session.messageIndex.set(messageId, rawSafe);
 
         console.log("📩 Nova mensagem recebida");
       }
     });
 
-    // 🔗 STATUS + QR (CORRIGIDO)
+    // STATUS + QR
     socket.ev.on("connection.update", async (update) => {
       const { connection, qr, lastDisconnect } = update;
 
@@ -141,7 +136,7 @@ class SessionManager {
         try {
           session.qrcode = await QRCode.toDataURL(qr);
         } catch (err) {
-          console.error("Erro ao gerar QR:", err.message);
+          console.error("Erro QR:", err.message);
         }
       }
 
@@ -173,7 +168,6 @@ class SessionManager {
       }
     });
 
-    // aguarda QR
     return new Promise((resolve) => {
       const timer = setInterval(() => {
         if (session.qrcode) {
@@ -184,7 +178,6 @@ class SessionManager {
     });
   }
 
-  // 📊 STATUS
   getStatus(id) {
     const session = this.sessions.get(id);
     if (!session) return { status: "not_found" };
@@ -196,7 +189,6 @@ class SessionManager {
     };
   }
 
-  // 🔌 DESCONECTAR
   async disconnect(id) {
     const session = this.sessions.get(id);
     if (!session) return;
@@ -213,7 +205,6 @@ class SessionManager {
     session.phone = null;
   }
 
-  // ❌ REMOVER
   async remove(id) {
     await this.disconnect(id);
     this.sessions.delete(id);
@@ -224,24 +215,65 @@ class SessionManager {
     }
   }
 
-  // 📤 ENVIAR MENSAGEM
-  async sendMessage(id, { phone, message }) {
+  // 🚀 ENVIO CORRIGIDO
+  async sendMessage(id, { phone, message, type, mediaUrl }) {
     const session = this.sessions.get(id);
-    if (!session?.socket) throw new Error("Not connected");
 
-    const jid = `${phone.replace(/\D/g, "")}@s.whatsapp.net`;
+    if (!session?.socket) {
+      throw new Error("Instância não conectada");
+    }
 
-    const sent = await session.socket.sendMessage(jid, {
-      text: message,
-    });
+    if (session.status !== "connected") {
+      throw new Error("Instância não está conectada");
+    }
 
-    return {
-      messageId: sent.key.id,
-      to: jid,
-    };
+    const clean = String(phone || "").replace(/\D/g, "");
+    if (!clean) {
+      throw new Error("Número inválido");
+    }
+
+    const jid = `${clean}@s.whatsapp.net`;
+
+    console.log(`📤 Enviando para ${jid}`);
+
+    let sent;
+
+    try {
+      if (type === "image" && mediaUrl) {
+        sent = await session.socket.sendMessage(jid, {
+          image: { url: mediaUrl },
+          caption: message || "",
+        });
+      } else if (type === "video" && mediaUrl) {
+        sent = await session.socket.sendMessage(jid, {
+          video: { url: mediaUrl },
+          caption: message || "",
+        });
+      } else if (type === "audio" && mediaUrl) {
+        sent = await session.socket.sendMessage(jid, {
+          audio: { url: mediaUrl },
+          mimetype: "audio/mp4",
+          ptt: true,
+        });
+      } else {
+        sent = await session.socket.sendMessage(jid, {
+          text: message,
+        });
+      }
+
+      console.log("✅ Mensagem enviada");
+
+      return {
+        messageId: sent.key.id,
+        to: jid,
+      };
+
+    } catch (err) {
+      console.error("❌ Erro envio:", err.message);
+      throw err;
+    }
   }
 
-  // 🖼️ DOWNLOAD DE MÍDIA
   async downloadMedia(id, messageId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Sessão não encontrada");
@@ -258,7 +290,7 @@ class SessionManager {
       try {
         buffer = await downloadMediaMessage(rawMsg, "buffer", {});
         if (buffer) break;
-      } catch (err) {
+      } catch {
         if (i === DOWNLOAD_RETRY) {
           return { found: false, error: "Erro ao baixar mídia" };
         }
