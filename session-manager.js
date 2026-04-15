@@ -33,6 +33,58 @@ class SessionManager {
     return null;
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // WEBHOOK — Envia eventos para URL configurada
+  // ═══════════════════════════════════════════════════════════════
+  /**
+   * Configura o webhook URL para uma instância.
+   * Quando configurado, mensagens e eventos de conexão são enviados
+   * automaticamente para esta URL via POST.
+   */
+  setWebhook(id, webhookUrl) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    session.webhookUrl = webhookUrl || null;
+    console.log(`🔗 Webhook ${webhookUrl ? 'set' : 'removed'} for instance ${id}: ${webhookUrl || 'none'}`);
+    return { success: true, webhookUrl: session.webhookUrl };
+  }
+
+  getWebhook(id) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    return { webhookUrl: session.webhookUrl || null };
+  }
+
+  /**
+   * Envia evento ao webhook configurado (fire-and-forget).
+   * Nunca bloqueia o fluxo principal se falhar.
+   */
+  async _notifyWebhook(session, payload) {
+    if (!session.webhookUrl) return;
+    
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10000);
+      
+      const response = await fetch(session.webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      
+      const responseText = await response.text().catch(() => "");
+      console.log(`✅ Webhook POST → ${session.webhookUrl} — status: ${response.status}`);
+      
+      if (!response.ok) {
+        console.error(`❌ Webhook error response: ${response.status} — ${responseText.substring(0, 200)}`);
+      }
+    } catch (err) {
+      console.error(`❌ Webhook POST failed → ${session.webhookUrl}:`, err.message);
+    }
+  }
+
   async create() {
     const id = uuidv4();
     const token = uuidv4();
@@ -47,11 +99,12 @@ class SessionManager {
       phone: null,
       qrcode: null,
       campaigns: new Map(),
+      webhookUrl: null, // URL para envio de eventos via webhook
 
-      // novos armazenamentos em memória
-      contacts: new Map(), // jid -> { jid, phone, name, pushName, lastMessageAt }
-      chats: new Map(),    // jid -> { jid, name, phone, lastMessage, lastMessageAt, unreadCount }
-      messages: new Map(), // jid -> [ { id, fromMe, text, timestamp, type, status, remoteJid, participant } ]
+      // armazenamentos em memória
+      contacts: new Map(),
+      chats: new Map(),
+      messages: new Map(),
     };
 
     this.sessions.set(id, session);
@@ -96,7 +149,9 @@ class SessionManager {
     // salvar credenciais
     socket.ev.on("creds.update", saveCreds);
 
-    // capturar mensagens recebidas/enviadas
+    // ═══════════════════════════════════════════════════════════════
+    // CAPTURA DE MENSAGENS + ENVIO AO WEBHOOK
+    // ═══════════════════════════════════════════════════════════════
     socket.ev.on("messages.upsert", async ({ messages, type }) => {
       try {
         if (!messages || !Array.isArray(messages)) return;
@@ -150,6 +205,38 @@ class SessionManager {
               ? 0
               : (session.chats.get(remoteJid)?.unreadCount || 0) + 1,
           });
+
+          // ═══════════════════════════════════════════════════════
+          // WEBHOOK: Enviar mensagem recebida ao CRM
+          // ═══════════════════════════════════════════════════════
+          if (session.webhookUrl) {
+            const webhookPayload = {
+              event: "message",
+              from: this._jidToPhone(remoteJid),
+              message: text || `[${messageType}]`,
+              pushName: msg.pushName || contactName,
+              fromMe,
+              instance_id: session.id,
+              timestamp: new Date(timestamp).toISOString(),
+            };
+
+            // Adicionar info de mídia
+            if (messageType === "image") {
+              webhookPayload.media_type = "image";
+              webhookPayload.caption = msg.message?.imageMessage?.caption;
+            } else if (messageType === "audio") {
+              webhookPayload.media_type = "audio";
+            } else if (messageType === "video") {
+              webhookPayload.media_type = "video";
+              webhookPayload.caption = msg.message?.videoMessage?.caption;
+            } else if (messageType === "document") {
+              webhookPayload.media_type = "document";
+              webhookPayload.filename = msg.message?.documentMessage?.fileName;
+            }
+
+            console.log(`📨 Webhook: message from ${webhookPayload.from} (fromMe=${fromMe})`);
+            this._notifyWebhook(session, webhookPayload);
+          }
         }
       } catch (err) {
         console.error("messages.upsert error:", err.message);
@@ -176,6 +263,9 @@ class SessionManager {
       }
     });
 
+    // ═══════════════════════════════════════════════════════════════
+    // CONEXÃO + WEBHOOK DE STATUS
+    // ═══════════════════════════════════════════════════════════════
     socket.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
@@ -196,11 +286,28 @@ class SessionManager {
           session.phone = jid.split(":")[0].split("@")[0];
         }
         console.log(`✅ Instance ${id} connected (${session.phone})`);
+
+        // WEBHOOK: Notificar conexão bem-sucedida
+        this._notifyWebhook(session, {
+          event: "connected",
+          instance_id: session.id,
+          phone: session.phone,
+          timestamp: new Date().toISOString(),
+        });
       }
 
       if (connection === "close") {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+
+        // WEBHOOK: Notificar desconexão
+        this._notifyWebhook(session, {
+          event: "disconnected",
+          instance_id: session.id,
+          reason: shouldReconnect ? "temporary" : "logged_out",
+          statusCode,
+          timestamp: new Date().toISOString(),
+        });
 
         if (shouldReconnect) {
           console.log(`🔄 Instance ${id} reconnecting...`);
@@ -343,7 +450,7 @@ class SessionManager {
     this._appendMessage(session, jid, {
       id: messageId || uuidv4(),
       fromMe: true,
-      text: message || "",
+      text: message || `[${type}]`,
       timestamp,
       type: type || "text",
       status: "sent",
@@ -355,60 +462,58 @@ class SessionManager {
       jid,
       phone: this._jidToPhone(jid),
       name: contactName,
-      lastMessage: message || `[${type || "text"}]`,
+      lastMessage: message || `[${type}]`,
       lastMessageAt: timestamp,
       unreadCount: 0,
     });
 
-    console.log(`✅ Message sent | instance=${id} | jid=${jid} | messageId=${messageId}`);
-
-    return { messageId, jid };
+    return { messageId, to: jid, timestamp };
   }
 
   bulkSend(id, { folderId, phones, message, mediaUrl, type, delayMin, delayMax }) {
     const session = this.sessions.get(id);
-    if (!session) return;
+    if (!session?.socket) throw new Error("Not connected");
 
     const campaign = {
       folderId,
-      status: "sending",
+      status: "running",
       total: phones.length,
       sent: 0,
       failed: 0,
-      cancelled: false,
-      paused: false,
+      errors: [],
+      startedAt: Date.now(),
+      controller: new AbortController(),
     };
+
     session.campaigns.set(folderId, campaign);
 
     (async () => {
       for (const phone of phones) {
-        if (campaign.cancelled) {
-          campaign.status = "cancelled";
-          break;
+        if (campaign.status === "paused") {
+          while (campaign.status === "paused") {
+            await this._sleep(500);
+          }
         }
-
-        while (campaign.paused) {
-          await this._sleep(1000);
-          if (campaign.cancelled) break;
-        }
+        if (campaign.controller.signal.aborted) break;
 
         try {
           await this.sendMessage(id, { phone, message, type, mediaUrl });
           campaign.sent++;
         } catch (err) {
           campaign.failed++;
-          console.error(`Failed to send to ${phone}:`, err.message);
+          campaign.errors.push({ phone, error: err.message });
         }
 
-        const delay =
-          Math.floor(Math.random() * (delayMax - delayMin + 1) + delayMin) * 1000;
-        await this._sleep(delay);
+        const delay = Math.random() * (delayMax - delayMin) + delayMin;
+        await this._sleep(delay * 1000);
       }
 
-      if (campaign.status === "sending") {
+      if (!campaign.controller.signal.aborted) {
         campaign.status = "completed";
       }
     })();
+
+    return { folderId, status: "running", total: phones.length };
   }
 
   controlCampaign(id, folderId, action) {
@@ -420,29 +525,28 @@ class SessionManager {
 
     switch (action) {
       case "pause":
-        campaign.paused = true;
         campaign.status = "paused";
         break;
       case "resume":
-        campaign.paused = false;
-        campaign.status = "sending";
+        campaign.status = "running";
         break;
       case "delete":
-      case "cancel":
-        campaign.cancelled = true;
-        campaign.status = "cancelled";
+        campaign.controller.abort();
+        campaign.status = "deleted";
         break;
+      default:
+        throw new Error("Invalid action: use pause, resume, or delete");
     }
 
-    return { status: campaign.status };
+    return { folderId, status: campaign.status };
   }
 
   getCampaignStatus(id, folderId) {
     const session = this.sessions.get(id);
-    if (!session) return { error: "Session not found" };
+    if (!session) throw new Error("Session not found");
 
     const campaign = session.campaigns.get(folderId);
-    if (!campaign) return { error: "Campaign not found" };
+    if (!campaign) throw new Error("Campaign not found");
 
     return {
       folderId: campaign.folderId,
@@ -450,62 +554,66 @@ class SessionManager {
       total: campaign.total,
       sent: campaign.sent,
       failed: campaign.failed,
+      errors: campaign.errors,
     };
   }
-
-  listAll() {
-    const list = [];
-    for (const [, s] of this.sessions) {
-      list.push({
-        id: s.id,
-        name: s.name,
-        status: s.status,
-        phone: s.phone,
-      });
-    }
-    return list;
-  }
-
-  // NOVOS MÉTODOS PARA LEITURA
 
   getContacts(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
-
-    return Array.from(session.contacts.values()).sort((a, b) => {
-      return (b.lastMessageAt || 0) - (a.lastMessageAt || 0);
-    });
+    return Array.from(session.contacts.values());
   }
 
   getChats(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
-
-    return Array.from(session.chats.values()).sort((a, b) => {
-      return (b.lastMessageAt || 0) - (a.lastMessageAt || 0);
-    });
+    const allChats = Array.from(session.chats.values());
+    allChats.sort((a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0));
+    return allChats;
   }
 
   getMessages(id, chatId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
 
-    return session.messages.get(chatId) || [];
+    let jid = chatId;
+    if (!jid.includes("@")) {
+      jid = this._formatJid(chatId);
+    }
+    const msgs = session.messages.get(jid) || [];
+    return msgs.slice(-200);
   }
 
   markChatAsRead(id, chatId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
 
-    const chat = session.chats.get(chatId);
-    if (!chat) return { success: false, error: "Chat not found" };
+    let jid = chatId;
+    if (!jid.includes("@")) {
+      jid = this._formatJid(chatId);
+    }
 
-    chat.unreadCount = 0;
-    session.chats.set(chatId, chat);
-    return { success: true };
+    const chat = session.chats.get(jid);
+    if (chat) {
+      chat.unreadCount = 0;
+    }
+
+    return { success: true, chatId: jid };
   }
 
-  // HELPERS INTERNOS
+  listAll() {
+    const result = [];
+    for (const [, session] of this.sessions) {
+      result.push({
+        id: session.id,
+        name: session.name,
+        status: session.status,
+        phone: session.phone,
+        webhookUrl: session.webhookUrl || null,
+      });
+    }
+    return result;
+  }
 
   _upsertContact(session, jid, data) {
     const existing = session.contacts.get(jid) || {};
@@ -536,8 +644,6 @@ class SessionManager {
   _appendMessage(session, jid, message) {
     const current = session.messages.get(jid) || [];
     current.push(message);
-
-    // limitar histórico em memória por conversa
     const trimmed = current.slice(-500);
     session.messages.set(jid, trimmed);
   }
