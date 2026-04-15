@@ -34,23 +34,14 @@ function requireInstance(req, res, next) {
 
 // Health check
 app.get("/health", (req, res) => {
-  res.json({
-    success: true,
-    status: "ok",
-    instances: sessions.count(),
-  });
+  res.json({ success: true, status: "ok", instances: sessions.count() });
 });
 
 // Create new instance
 app.post("/instance/init", requireAdmin, async (req, res) => {
   try {
     const instance = await sessions.create();
-    res.json({
-      success: true,
-      id: instance.id,
-      token: instance.token,
-      name: instance.name,
-    });
+    res.json({ success: true, id: instance.id, token: instance.token, name: instance.name });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -96,63 +87,62 @@ app.delete("/instance/:id", requireAdmin, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// WEBHOOK — Configurar URL de callback por instância
+// ═══════════════════════════════════════════════════════════════
+
+// Set webhook URL for an instance
+app.post("/instance/setWebhook", requireInstance, (req, res) => {
+  try {
+    const { webhookUrl } = req.body;
+    const result = sessions.setWebhook(req.session.id, webhookUrl);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Get webhook URL for an instance
+app.get("/instance/webhook", requireInstance, (req, res) => {
+  try {
+    const result = sessions.getWebhook(req.session.id);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // Send message to single contact
 app.post("/message/send", requireInstance, async (req, res) => {
   try {
     const { phone, message, type, mediaUrl } = req.body;
-
-    if (!phone) {
-      return res.status(400).json({ success: false, error: "phone is required" });
-    }
-
-    if (!message && !mediaUrl) {
-      return res.status(400).json({ success: false, error: "message or mediaUrl is required" });
-    }
-
-    const result = await sessions.sendMessage(req.session.id, {
-      phone,
-      message,
-      type: type || "text",
-      mediaUrl,
-    });
-
+    if (!phone) return res.status(400).json({ success: false, error: "phone is required" });
+    if (!message && !mediaUrl) return res.status(400).json({ success: false, error: "message or mediaUrl is required" });
+    const result = await sessions.sendMessage(req.session.id, { phone, message, type: type || "text", mediaUrl });
     res.json({ success: true, delivered: true, ...result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Bulk send (campaign)
+// Bulk send
 app.post("/sender/simple", requireInstance, async (req, res) => {
   try {
     const { phones, message, mediaUrl, type, delayMin, delayMax } = req.body;
-
     if (!Array.isArray(phones) || phones.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: "phones must be a non-empty array",
-      });
+      return res.status(400).json({ success: false, error: "phones must be a non-empty array" });
     }
-
     const folderId = uuidv4();
-
     sessions.bulkSend(req.session.id, {
-      folderId,
-      phones,
-      message,
-      mediaUrl,
-      type: type || "text",
-      delayMin: delayMin || 10,
-      delayMax: delayMax || 30,
+      folderId, phones, message, mediaUrl,
+      type: type || "text", delayMin: delayMin || 10, delayMax: delayMax || 30,
     });
-
     res.json({ success: true, folderId });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Campaign control (pause/resume/delete)
 app.post("/sender/edit", requireInstance, async (req, res) => {
   try {
     const { folderId, action } = req.body;
@@ -163,7 +153,6 @@ app.post("/sender/edit", requireInstance, async (req, res) => {
   }
 });
 
-// Get campaign status
 app.get("/sender/status/:folderId", requireInstance, (req, res) => {
   try {
     const status = sessions.getCampaignStatus(req.session.id, req.params.folderId);
@@ -173,7 +162,6 @@ app.get("/sender/status/:folderId", requireInstance, (req, res) => {
   }
 });
 
-// List all instances (admin)
 app.get("/instances", requireAdmin, (req, res) => {
   try {
     res.json({ success: true, instances: sessions.listAll() });
@@ -182,31 +170,22 @@ app.get("/instances", requireAdmin, (req, res) => {
   }
 });
 
-// =========================
-// NOVAS ROTAS DE LEITURA
-// =========================
-
-// List contacts for current instance
 app.get("/contacts", requireInstance, (req, res) => {
   try {
-    const contacts = sessions.getContacts(req.session.id);
-    res.json({ success: true, contacts });
+    res.json({ success: true, contacts: sessions.getContacts(req.session.id) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// List chats/conversations for current instance
 app.get("/chats", requireInstance, (req, res) => {
   try {
-    const chats = sessions.getChats(req.session.id);
-    res.json({ success: true, chats });
+    res.json({ success: true, chats: sessions.getChats(req.session.id) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Get messages from one chat
 app.get("/messages/:chatId", requireInstance, (req, res) => {
   try {
     const chatId = decodeURIComponent(req.params.chatId);
@@ -217,15 +196,10 @@ app.get("/messages/:chatId", requireInstance, (req, res) => {
   }
 });
 
-// Optional: all messages for a chat via querystring
 app.get("/messages", requireInstance, (req, res) => {
   try {
     const { chatId } = req.query;
-
-    if (!chatId) {
-      return res.status(400).json({ success: false, error: "chatId is required" });
-    }
-
+    if (!chatId) return res.status(400).json({ success: false, error: "chatId is required" });
     const messages = sessions.getMessages(req.session.id, String(chatId));
     res.json({ success: true, messages });
   } catch (err) {
@@ -233,15 +207,10 @@ app.get("/messages", requireInstance, (req, res) => {
   }
 });
 
-// Mark chat as read
 app.post("/chat/read", requireInstance, (req, res) => {
   try {
     const { chatId } = req.body;
-
-    if (!chatId) {
-      return res.status(400).json({ success: false, error: "chatId is required" });
-    }
-
+    if (!chatId) return res.status(400).json({ success: false, error: "chatId is required" });
     const result = sessions.markChatAsRead(req.session.id, chatId);
     res.json(result);
   } catch (err) {
@@ -249,13 +218,12 @@ app.post("/chat/read", requireInstance, (req, res) => {
   }
 });
 
-// Home route
 app.get("/", (req, res) => {
   res.json({
     success: true,
     service: "WhatsApp Engine",
     status: "online",
-    version: "1.1.0",
+    version: "1.2.0",
     routes: [
       "GET /health",
       "POST /instance/init",
@@ -263,6 +231,8 @@ app.get("/", (req, res) => {
       "GET /instance/status",
       "POST /instance/disconnect",
       "DELETE /instance/:id",
+      "POST /instance/setWebhook",
+      "GET /instance/webhook",
       "POST /message/send",
       "POST /sender/simple",
       "POST /sender/edit",
@@ -278,7 +248,8 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🚀 WhatsApp Engine rodando na porta ${PORT}`);
+  console.log(`\n🚀 WhatsApp Engine v1.2.0 rodando na porta ${PORT}`);
   console.log(`🔑 Admin Token: ${ADMIN_TOKEN}`);
+  console.log(`📡 Webhook support: ENABLED`);
   console.log(`\nUse este token como WHATSAPI_ADMIN_TOKEN no Lovable Cloud.\n`);
 });
