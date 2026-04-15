@@ -8,7 +8,6 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const { v4: uuidv4 } = require("uuid");
-const QRCode = require("qrcode");
 const pino = require("pino");
 const path = require("path");
 const fs = require("fs");
@@ -23,11 +22,24 @@ const DOWNLOAD_RETRY = 2;
 class SessionManager {
   constructor() {
     this.sessions = new Map();
+
     if (!fs.existsSync(SESSIONS_DIR)) {
       fs.mkdirSync(SESSIONS_DIR, { recursive: true });
     }
   }
 
+  // 🔑 Buscar sessão pelo token
+  getByToken(token) {
+    if (!token) return null;
+
+    for (const [, session] of this.sessions) {
+      if (session.token === token) return session;
+    }
+
+    return null;
+  }
+
+  // 🆕 Criar instância
   async create() {
     const id = uuidv4();
     const token = uuidv4();
@@ -40,13 +52,15 @@ class SessionManager {
       qrcode: null,
 
       messages: new Map(),
-      messageIndex: new Map(), // ⚡ índice global
+      messageIndex: new Map(),
     };
 
     this.sessions.set(id, session);
+
     return { id, token };
   }
 
+  // 🔌 Conectar WhatsApp
   async connect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -66,9 +80,11 @@ class SessionManager {
     });
 
     session.socket = socket;
+    session.status = "connecting";
 
     socket.ev.on("creds.update", saveCreds);
 
+    // 📩 RECEBER MENSAGENS
     socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const msg of messages) {
         const jid = msg.key.remoteJid;
@@ -88,35 +104,96 @@ class SessionManager {
           rawMessage: rawSafe,
         };
 
-        // histórico do chat
         const list = session.messages.get(jid) || [];
         list.push(data);
 
-        // limite por quantidade
         const trimmed = list.slice(-MAX_MESSAGES_PER_CHAT);
 
-        // filtro por tempo
         const now = Date.now();
         const filtered = trimmed.filter(m => now - m.timestamp < MESSAGE_TTL);
 
-        // 🔥 LIMPEZA DO INDEX (CORREÇÃO CRÍTICA)
+        // limpar index antigo
         const removedIds = list
           .slice(0, list.length - filtered.length)
           .map(m => m.id);
 
-        removedIds.forEach(rid => session.messageIndex.delete(rid));
+        removedIds.forEach(id => session.messageIndex.delete(id));
 
         session.messages.set(jid, filtered);
 
-        // index global (lookup O(1))
         session.messageIndex.set(messageId, rawSafe);
       }
     });
 
-    return true;
+    // 🔗 STATUS + QR
+    socket.ev.on("connection.update", async (update) => {
+      const { connection, qr } = update;
+
+      if (qr) {
+        session.qrcode = qr;
+      }
+
+      if (connection === "open") {
+        session.status = "connected";
+        session.qrcode = null;
+      }
+
+      if (connection === "close") {
+        session.status = "disconnected";
+        session.socket = null;
+      }
+    });
+
+    // aguarda QR
+    return new Promise((resolve) => {
+      const timer = setInterval(() => {
+        if (session.qrcode) {
+          clearInterval(timer);
+          resolve(session.qrcode);
+        }
+      }, 500);
+    });
   }
 
-  // 🚀 DOWNLOAD COM RETRY + VALIDAÇÃO
+  // 📊 STATUS
+  getStatus(id) {
+    const session = this.sessions.get(id);
+    if (!session) return { status: "not_found" };
+
+    return {
+      status: session.status,
+      qrcode: session.qrcode,
+    };
+  }
+
+  // 🔌 DESCONECTAR
+  async disconnect(id) {
+    const session = this.sessions.get(id);
+    if (!session) return;
+
+    if (session.socket) {
+      try {
+        await session.socket.logout();
+      } catch {}
+    }
+
+    session.status = "disconnected";
+    session.socket = null;
+    session.qrcode = null;
+  }
+
+  // ❌ REMOVER
+  async remove(id) {
+    await this.disconnect(id);
+    this.sessions.delete(id);
+
+    const sessionDir = path.join(SESSIONS_DIR, id);
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  }
+
+  // 🖼️ DOWNLOAD DE MÍDIA
   async downloadMedia(id, messageId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Sessão não encontrada");
