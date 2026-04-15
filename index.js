@@ -32,7 +32,6 @@ function requireAdmin(req, res, next) {
 
 function requireInstance(req, res, next) {
   const token = req.headers["token"];
-
   const session = sessions.getByToken(token);
 
   if (!session) {
@@ -59,32 +58,6 @@ app.get("/health", (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// 📊 SYSTEM METRICS
-// ═══════════════════════════════════════════════════════════════
-
-app.get("/system/metrics", requireAdmin, (req, res) => {
-  try {
-    const mem = process.memoryUsage();
-    const cpus = os.cpus();
-    const totalMem = os.totalmem();
-    const freeMem = os.freemem();
-
-    res.json({
-      success: true,
-      memory: {
-        total_mb: Math.round(totalMem / 1024 / 1024),
-        free_mb: Math.round(freeMem / 1024 / 1024),
-      },
-      cpu_cores: cpus.length,
-      uptime: process.uptime(),
-      heap_used_mb: Math.round(mem.heapUsed / 1024 / 1024),
-    });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
 // 📦 INSTÂNCIAS
 // ═══════════════════════════════════════════════════════════════
 
@@ -92,13 +65,16 @@ app.post("/instance/init", requireAdmin, async (req, res) => {
   try {
     const instance = await sessions.create();
 
-    res.json({
+    return res.json({
       success: true,
       id: instance.id,
       token: instance.token,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
@@ -106,12 +82,15 @@ app.post("/instance/connect", requireInstance, async (req, res) => {
   try {
     const qrcode = await sessions.connect(req.session.id);
 
-    res.json({
+    return res.json({
       success: true,
       qrcode,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
@@ -119,37 +98,20 @@ app.get("/instance/status", requireInstance, (req, res) => {
   try {
     const status = sessions.getStatus(req.session.id);
 
-    res.json({
+    return res.json({
       success: true,
       ...status,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post("/instance/disconnect", requireInstance, async (req, res) => {
-  try {
-    await sessions.disconnect(req.session.id);
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.delete("/instance/:id", requireAdmin, async (req, res) => {
-  try {
-    await sessions.remove(req.params.id);
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// 💬 ENVIO DE MENSAGEM (CORRIGIDO)
+// 💬 ENVIO DE MENSAGEM (FIX REAL)
 // ═══════════════════════════════════════════════════════════════
 
 app.post("/message/send", requireInstance, async (req, res) => {
@@ -168,15 +130,20 @@ app.post("/message/send", requireInstance, async (req, res) => {
       message,
     });
 
-    res.json({
+    // 🔥 GARANTIR JSON SEMPRE
+    return res.json({
       success: true,
       delivered: true,
-      ...result,
+      messageId: result?.messageId || null,
+      to: result?.to || null,
     });
+
   } catch (err) {
-    res.status(500).json({
+    console.error("❌ SEND ERROR:", err);
+
+    return res.status(500).json({
       success: false,
-      error: err.message,
+      error: err.message || "send failed",
     });
   }
 });
@@ -199,12 +166,12 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
       });
     }
 
-    res.set("Content-Type", result.mimetype);
+    res.set("Content-Type", result.mimetype || "application/octet-stream");
     res.set("Content-Disposition", "inline");
 
-    res.send(result.buffer);
+    return res.send(result.buffer);
   } catch (err) {
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: err.message,
     });
@@ -220,7 +187,7 @@ app.get("/", (req, res) => {
     success: true,
     service: "WhatsApp Engine",
     status: "online",
-    version: "1.5.0",
+    version: "1.6.0",
   });
 });
 
