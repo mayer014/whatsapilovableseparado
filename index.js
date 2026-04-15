@@ -44,7 +44,7 @@ app.get("/health", (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// MÉTRICAS REAIS DO SISTEMA (CPU, RAM, Processo Node.js)
+// MÉTRICAS DO SISTEMA
 // ═══════════════════════════════════════════════════════════════
 
 app.get("/system/metrics", requireAdmin, (req, res) => {
@@ -55,7 +55,6 @@ app.get("/system/metrics", requireAdmin, (req, res) => {
     const freeMem = os.freemem();
     const usedMem = totalMem - freeMem;
 
-    // Calcular uso médio de CPU desde o boot
     let totalIdle = 0, totalTick = 0;
     cpus.forEach(cpu => {
       for (const type in cpu.times) {
@@ -63,6 +62,7 @@ app.get("/system/metrics", requireAdmin, (req, res) => {
       }
       totalIdle += cpu.times.idle;
     });
+
     const cpuUsagePercent = parseFloat(((1 - totalIdle / totalTick) * 100).toFixed(1));
 
     res.json({
@@ -92,7 +92,7 @@ app.get("/system/metrics", requireAdmin, (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// INSTÂNCIAS — CRUD e conexão
+// INSTÂNCIAS
 // ═══════════════════════════════════════════════════════════════
 
 app.post("/instance/init", requireAdmin, async (req, res) => {
@@ -141,7 +141,7 @@ app.delete("/instance/:id", requireAdmin, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// WEBHOOK — Configurar URL de callback por instância
+// WEBHOOK
 // ═══════════════════════════════════════════════════════════════
 
 app.post("/instance/setWebhook", requireInstance, (req, res) => {
@@ -164,7 +164,7 @@ app.get("/instance/webhook", requireInstance, (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// MENSAGENS — Envio individual e em massa
+// MENSAGENS
 // ═══════════════════════════════════════════════════════════════
 
 app.post("/message/send", requireInstance, async (req, res) => {
@@ -172,111 +172,53 @@ app.post("/message/send", requireInstance, async (req, res) => {
     const { phone, message, type, mediaUrl } = req.body;
     if (!phone) return res.status(400).json({ success: false, error: "phone is required" });
     if (!message && !mediaUrl) return res.status(400).json({ success: false, error: "message or mediaUrl is required" });
-    const result = await sessions.sendMessage(req.session.id, { phone, message, type: type || "text", mediaUrl });
+
+    const result = await sessions.sendMessage(req.session.id, {
+      phone,
+      message,
+      type: type || "text",
+      mediaUrl
+    });
+
     res.json({ success: true, delivered: true, ...result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.post("/sender/simple", requireInstance, async (req, res) => {
+// ═══════════════════════════════════════════════════════════════
+// MÍDIA (🔥 NOVO)
+// ═══════════════════════════════════════════════════════════════
+
+app.get("/media/:messageId", requireInstance, async (req, res) => {
   try {
-    const { phones, message, mediaUrl, type, delayMin, delayMax } = req.body;
-    if (!Array.isArray(phones) || phones.length === 0) {
-      return res.status(400).json({ success: false, error: "phones must be a non-empty array" });
+    const result = await sessions.downloadMedia(
+      req.session.id,
+      req.params.messageId
+    );
+
+    if (!result.found) {
+      return res.status(410).json({
+        success: false,
+        error: result.error,
+      });
     }
-    const folderId = uuidv4();
-    sessions.bulkSend(req.session.id, {
-      folderId, phones, message, mediaUrl,
-      type: type || "text", delayMin: delayMin || 10, delayMax: delayMax || 30,
+
+    res.set("Content-Type", result.mimetype);
+    res.set("Content-Disposition", "inline");
+    res.set("Cache-Control", "public, max-age=3600");
+
+    res.send(result.buffer);
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message,
     });
-    res.json({ success: true, folderId });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post("/sender/edit", requireInstance, async (req, res) => {
-  try {
-    const { folderId, action } = req.body;
-    const result = sessions.controlCampaign(req.session.id, folderId, action);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get("/sender/status/:folderId", requireInstance, (req, res) => {
-  try {
-    const status = sessions.getCampaignStatus(req.session.id, req.params.folderId);
-    res.json({ success: true, ...status });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
   }
 });
 
 // ═══════════════════════════════════════════════════════════════
-// LISTAGENS — Instâncias, contatos, chats, mensagens
-// ═══════════════════════════════════════════════════════════════
-
-app.get("/instances", requireAdmin, (req, res) => {
-  try {
-    res.json({ success: true, instances: sessions.listAll() });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get("/contacts", requireInstance, (req, res) => {
-  try {
-    res.json({ success: true, contacts: sessions.getContacts(req.session.id) });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get("/chats", requireInstance, (req, res) => {
-  try {
-    res.json({ success: true, chats: sessions.getChats(req.session.id) });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get("/messages/:chatId", requireInstance, (req, res) => {
-  try {
-    const chatId = decodeURIComponent(req.params.chatId);
-    const messages = sessions.getMessages(req.session.id, chatId);
-    res.json({ success: true, messages });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.get("/messages", requireInstance, (req, res) => {
-  try {
-    const { chatId } = req.query;
-    if (!chatId) return res.status(400).json({ success: false, error: "chatId is required" });
-    const messages = sessions.getMessages(req.session.id, String(chatId));
-    res.json({ success: true, messages });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post("/chat/read", requireInstance, (req, res) => {
-  try {
-    const { chatId } = req.body;
-    if (!chatId) return res.status(400).json({ success: false, error: "chatId is required" });
-    const result = sessions.markChatAsRead(req.session.id, chatId);
-    res.json(result);
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════
-// ROTA RAIZ — Informações do serviço
+// ROOT
 // ═══════════════════════════════════════════════════════════════
 
 app.get("/", (req, res) => {
@@ -284,39 +226,15 @@ app.get("/", (req, res) => {
     success: true,
     service: "WhatsApp Engine",
     status: "online",
-    version: "1.3.0",
-    routes: [
-      "GET /health",
-      "GET /system/metrics",
-      "POST /instance/init",
-      "POST /instance/connect",
-      "GET /instance/status",
-      "POST /instance/disconnect",
-      "DELETE /instance/:id",
-      "POST /instance/setWebhook",
-      "GET /instance/webhook",
-      "POST /message/send",
-      "POST /sender/simple",
-      "POST /sender/edit",
-      "GET /sender/status/:folderId",
-      "GET /instances",
-      "GET /contacts",
-      "GET /chats",
-      "GET /messages/:chatId",
-      "GET /messages?chatId=...",
-      "POST /chat/read",
-    ],
+    version: "1.4.0",
   });
 });
 
 // ═══════════════════════════════════════════════════════════════
-// INICIAR SERVIDOR
+// START
 // ═══════════════════════════════════════════════════════════════
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🚀 WhatsApp Engine v1.3.0 rodando na porta ${PORT}`);
+  console.log(`🚀 WhatsApp Engine rodando na porta ${PORT}`);
   console.log(`🔑 Admin Token: ${ADMIN_TOKEN}`);
-  console.log(`📡 Webhook support: ENABLED`);
-  console.log(`📊 System metrics: GET /system/metrics`);
-  console.log(`\nUse este token como WHATSAPI_ADMIN_TOKEN no Lovable Cloud.\n`);
 });
