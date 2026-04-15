@@ -15,11 +15,6 @@ const fs = require("fs");
 
 const SESSIONS_DIR = path.join(process.cwd(), "sessions");
 
-// CONFIG
-const MAX_MESSAGES_PER_CHAT = 500;
-const MESSAGE_TTL = 1000 * 60 * 60 * 24;
-const DOWNLOAD_RETRY = 2;
-
 class SessionManager {
   constructor() {
     this.sessions = new Map();
@@ -31,11 +26,9 @@ class SessionManager {
 
   getByToken(token) {
     if (!token) return null;
-
     for (const [, session] of this.sessions) {
       if (session.token === token) return session;
     }
-
     return null;
   }
 
@@ -51,12 +44,10 @@ class SessionManager {
       qrcode: null,
       phone: null,
 
-      messages: new Map(),
       messageIndex: new Map(),
     };
 
     this.sessions.set(id, session);
-
     return { id, token };
   }
 
@@ -85,7 +76,7 @@ class SessionManager {
 
     socket.ev.on("creds.update", saveCreds);
 
-    // RECEBER MENSAGENS
+    // 📩 RECEBER MENSAGENS
     socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const msg of messages) {
         if (!msg.message) continue;
@@ -93,51 +84,23 @@ class SessionManager {
         const jid = msg.key.remoteJid;
         if (!jid || jid === "status@broadcast") continue;
 
-        const messageId = msg.key.id || uuidv4();
-        const timestamp = Date.now();
+        const messageId = msg.key.id;
 
-        const rawSafe = {
+        session.messageIndex.set(messageId, {
           key: msg.key,
           message: msg.message,
-        };
-
-        const data = {
-          id: messageId,
-          timestamp,
-          rawMessage: rawSafe,
-        };
-
-        const list = session.messages.get(jid) || [];
-        list.push(data);
-
-        const trimmed = list.slice(-MAX_MESSAGES_PER_CHAT);
-
-        const now = Date.now();
-        const filtered = trimmed.filter(m => now - m.timestamp < MESSAGE_TTL);
-
-        const removedIds = list
-          .slice(0, list.length - filtered.length)
-          .map(m => m.id);
-
-        removedIds.forEach(id => session.messageIndex.delete(id));
-
-        session.messages.set(jid, filtered);
-        session.messageIndex.set(messageId, rawSafe);
+        });
 
         console.log("📩 Nova mensagem recebida");
       }
     });
 
-    // STATUS + QR
+    // 🔗 STATUS + QR
     socket.ev.on("connection.update", async (update) => {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
-        try {
-          session.qrcode = await QRCode.toDataURL(qr);
-        } catch (err) {
-          console.error("Erro QR:", err.message);
-        }
+        session.qrcode = await QRCode.toDataURL(qr);
       }
 
       if (connection === "open") {
@@ -146,7 +109,7 @@ class SessionManager {
 
         const jid = socket.user?.id;
         if (jid) {
-          session.phone = jid.split(":")[0].split("@")[0];
+          session.phone = jid.split("@")[0];
         }
 
         console.log("✅ Conectado:", id, session.phone);
@@ -159,7 +122,6 @@ class SessionManager {
 
         if (shouldReconnect) {
           console.log("🔄 Reconectando:", id);
-          session.status = "connecting";
           setTimeout(() => this.connect(id), 3000);
         } else {
           session.status = "disconnected";
@@ -189,89 +151,29 @@ class SessionManager {
     };
   }
 
-  async disconnect(id) {
-    const session = this.sessions.get(id);
-    if (!session) return;
-
-    if (session.socket) {
-      try {
-        await session.socket.logout();
-      } catch {}
-    }
-
-    session.status = "disconnected";
-    session.socket = null;
-    session.qrcode = null;
-    session.phone = null;
-  }
-
-  async remove(id) {
-    await this.disconnect(id);
-    this.sessions.delete(id);
-
-    const sessionDir = path.join(SESSIONS_DIR, id);
-    if (fs.existsSync(sessionDir)) {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    }
-  }
-
-  // 🚀 ENVIO CORRIGIDO
-  async sendMessage(id, { phone, message, type, mediaUrl }) {
+  async sendMessage(id, { phone, message }) {
     const session = this.sessions.get(id);
 
     if (!session?.socket) {
-      throw new Error("Instância não conectada");
+      throw new Error("Instance not connected");
     }
 
     if (session.status !== "connected") {
-      throw new Error("Instância não está conectada");
+      throw new Error("Instance not ready");
     }
 
-    const clean = String(phone || "").replace(/\D/g, "");
-    if (!clean) {
-      throw new Error("Número inválido");
-    }
-
+    const clean = String(phone).replace(/\D/g, "");
     const jid = `${clean}@s.whatsapp.net`;
 
-    console.log(`📤 Enviando para ${jid}`);
+    const sent = await session.socket.sendMessage(jid, {
+      text: message,
+    });
 
-    let sent;
-
-    try {
-      if (type === "image" && mediaUrl) {
-        sent = await session.socket.sendMessage(jid, {
-          image: { url: mediaUrl },
-          caption: message || "",
-        });
-      } else if (type === "video" && mediaUrl) {
-        sent = await session.socket.sendMessage(jid, {
-          video: { url: mediaUrl },
-          caption: message || "",
-        });
-      } else if (type === "audio" && mediaUrl) {
-        sent = await session.socket.sendMessage(jid, {
-          audio: { url: mediaUrl },
-          mimetype: "audio/mp4",
-          ptt: true,
-        });
-      } else {
-        sent = await session.socket.sendMessage(jid, {
-          text: message,
-        });
-      }
-
-      console.log("✅ Mensagem enviada");
-
-      return {
-        messageId: sent.key.id,
-        to: jid,
-      };
-
-    } catch (err) {
-      console.error("❌ Erro envio:", err.message);
-      throw err;
-    }
+    return {
+      messageId: sent?.key?.id || null,
+      to: jid,
+      success: true,
+    };
   }
 
   async downloadMedia(id, messageId) {
@@ -279,23 +181,9 @@ class SessionManager {
     if (!session) throw new Error("Sessão não encontrada");
 
     const rawMsg = session.messageIndex.get(messageId);
+    if (!rawMsg) return { found: false };
 
-    if (!rawMsg) {
-      return { found: false, error: "Mensagem não encontrada" };
-    }
-
-    let buffer = null;
-
-    for (let i = 0; i <= DOWNLOAD_RETRY; i++) {
-      try {
-        buffer = await downloadMediaMessage(rawMsg, "buffer", {});
-        if (buffer) break;
-      } catch {
-        if (i === DOWNLOAD_RETRY) {
-          return { found: false, error: "Erro ao baixar mídia" };
-        }
-      }
-    }
+    const buffer = await downloadMediaMessage(rawMsg, "buffer", {});
 
     return {
       found: true,
