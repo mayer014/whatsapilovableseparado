@@ -4,8 +4,9 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  downloadMediaMessage, // ✅ PASSO 1
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
+
 const { v4: uuidv4 } = require("uuid");
 const QRCode = require("qrcode");
 const pino = require("pino");
@@ -13,6 +14,11 @@ const path = require("path");
 const fs = require("fs");
 
 const SESSIONS_DIR = path.join(process.cwd(), "sessions");
+
+// CONFIG PRO
+const MAX_MESSAGES_PER_CHAT = 500;
+const MESSAGE_TTL = 1000 * 60 * 60 * 24; // 24h
+const DOWNLOAD_RETRY = 2;
 
 class SessionManager {
   constructor() {
@@ -22,96 +28,40 @@ class SessionManager {
     }
   }
 
-  count() {
-    return this.sessions.size;
-  }
-
-  getByToken(token) {
-    if (!token) return null;
-    for (const [, session] of this.sessions) {
-      if (session.token === token) return session;
-    }
-    return null;
-  }
-
-  setWebhook(id, webhookUrl) {
-    const session = this.sessions.get(id);
-    if (!session) throw new Error("Session not found");
-    session.webhookUrl = webhookUrl || null;
-    return { success: true, webhookUrl: session.webhookUrl };
-  }
-
-  getWebhook(id) {
-    const session = this.sessions.get(id);
-    if (!session) throw new Error("Session not found");
-    return { webhookUrl: session.webhookUrl || null };
-  }
-
-  async _notifyWebhook(session, payload) {
-    if (!session.webhookUrl) return;
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 10000);
-
-      await fetch(session.webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-
-      clearTimeout(timeout);
-    } catch {}
-  }
-
   async create() {
     const id = uuidv4();
     const token = uuidv4();
-    const name = `WhatsApp-${id.slice(0, 6)}`;
 
     const session = {
       id,
       token,
-      name,
       socket: null,
       status: "disconnected",
-      phone: null,
       qrcode: null,
-      campaigns: new Map(),
-      webhookUrl: null,
-      contacts: new Map(),
-      chats: new Map(),
+
       messages: new Map(),
+      messageIndex: new Map(), // ⚡ índice rápido
     };
 
     this.sessions.set(id, session);
-    return { id, token, name };
+    return { id, token };
   }
 
   async connect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
 
-    if (session.socket) {
-      try { session.socket.end(); } catch {}
-      session.socket = null;
-    }
-
-    session.status = "connecting";
-
     const sessionDir = path.join(SESSIONS_DIR, id);
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
-    const logger = pino({ level: "silent" });
 
     const socket = makeWASocket({
       version,
-      logger,
+      logger: pino({ level: "silent" }),
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
+        keys: makeCacheableSignalKeyStore(state.keys),
       },
-      printQRInTerminal: false,
     });
 
     session.socket = socket;
@@ -120,67 +70,84 @@ class SessionManager {
 
     socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const msg of messages) {
-        const remoteJid = msg.key.remoteJid;
-        if (!remoteJid || remoteJid === "status@broadcast") continue;
+        const jid = msg.key.remoteJid;
+        if (!jid || jid === "status@broadcast") continue;
 
-        const fromMe = !!msg.key.fromMe;
+        const messageId = msg.key.id || uuidv4();
         const timestamp = Date.now();
 
-        const text = this._extractMessageText(msg);
-        const type = this._extractMessageType(msg);
+        // 🔥 RAW OTIMIZADO (menos memória)
+        const rawSafe = {
+          key: msg.key,
+          message: msg.message,
+        };
 
-        this._appendMessage(session, remoteJid, {
-          id: msg.key.id || uuidv4(),
-          fromMe,
-          text,
+        const data = {
+          id: messageId,
           timestamp,
-          type,
-          status: fromMe ? "sent" : "received",
-          remoteJid,
-          participant: msg.key.participant || null,
-          rawMessage: msg, // ✅ PASSO 2
-        });
+          rawMessage: rawSafe,
+        };
+
+        // salvar por chat
+        const list = session.messages.get(jid) || [];
+        list.push(data);
+
+        // limpeza por quantidade
+        const trimmed = list.slice(-MAX_MESSAGES_PER_CHAT);
+
+        // limpeza por tempo
+        const now = Date.now();
+        const filtered = trimmed.filter(m => now - m.timestamp < MESSAGE_TTL);
+
+        session.messages.set(jid, filtered);
+
+        // ⚡ index global
+        session.messageIndex.set(messageId, rawSafe);
       }
     });
 
-    return new Promise((resolve) => {
-      const timer = setInterval(() => {
-        if (session.qrcode) {
-          clearInterval(timer);
-          resolve(session.qrcode);
-        }
-      }, 500);
-    });
+    return true;
   }
 
-  _appendMessage(session, jid, message) {
-    const current = session.messages.get(jid) || [];
-    current.push(message);
-    const trimmed = current.slice(-500);
-    session.messages.set(jid, trimmed);
-  }
-
-  // ✅ PASSO 3 — NOVO MÉTODO
+  // 🚀 DOWNLOAD PRO COM RETRY
   async downloadMedia(id, messageId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Sessão não encontrada");
 
-    let rawMsg = null;
-    for (const [, msgs] of session.messages) {
-      const found = msgs.find(m => m.id === messageId);
-      if (found?.rawMessage) {
-        rawMsg = found.rawMessage;
-        break;
+    const rawMsg = session.messageIndex.get(messageId);
+
+    if (!rawMsg) {
+      return { found: false, error: "Mensagem não encontrada ou expirada" };
+    }
+
+    const m = rawMsg.message || {};
+
+    // 🛡️ valida se tem mídia
+    const hasMedia =
+      m.imageMessage ||
+      m.audioMessage ||
+      m.videoMessage ||
+      m.documentMessage ||
+      m.stickerMessage;
+
+    if (!hasMedia) {
+      return { found: false, error: "Mensagem não contém mídia" };
+    }
+
+    let buffer = null;
+
+    // 🔁 retry automático
+    for (let i = 0; i <= DOWNLOAD_RETRY; i++) {
+      try {
+        buffer = await downloadMediaMessage(rawMsg, "buffer", {});
+        if (buffer) break;
+      } catch (err) {
+        if (i === DOWNLOAD_RETRY) {
+          return { found: false, error: "Falha ao baixar mídia" };
+        }
       }
     }
 
-    if (!rawMsg) {
-      return { found: false, error: "Mensagem não está mais no store (expirada)" };
-    }
-
-    const buffer = await downloadMediaMessage(rawMsg, "buffer", {});
-
-    const m = rawMsg.message || {};
     const mimetype =
       m.imageMessage?.mimetype ||
       m.audioMessage?.mimetype ||
@@ -190,27 +157,6 @@ class SessionManager {
       "application/octet-stream";
 
     return { found: true, buffer, mimetype };
-  }
-
-  _extractMessageText(msg) {
-    const m = msg.message || {};
-    return (
-      m.conversation ||
-      m.extendedTextMessage?.text ||
-      m.imageMessage?.caption ||
-      m.videoMessage?.caption ||
-      ""
-    );
-  }
-
-  _extractMessageType(msg) {
-    const m = msg.message || {};
-    if (m.conversation) return "text";
-    if (m.imageMessage) return "image";
-    if (m.videoMessage) return "video";
-    if (m.audioMessage) return "audio";
-    if (m.documentMessage) return "document";
-    return "unknown";
   }
 }
 
