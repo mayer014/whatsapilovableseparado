@@ -8,6 +8,7 @@ const {
 } = require("@whiskeysockets/baileys");
 
 const { v4: uuidv4 } = require("uuid");
+const QRCode = require("qrcode"); // ✅ IMPORTANTE
 const pino = require("pino");
 const path = require("path");
 const fs = require("fs");
@@ -112,7 +113,7 @@ class SessionManager {
         const now = Date.now();
         const filtered = trimmed.filter(m => now - m.timestamp < MESSAGE_TTL);
 
-        // limpar index antigo
+        // 🔥 LIMPEZA DO INDEX
         const removedIds = list
           .slice(0, list.length - filtered.length)
           .map(m => m.id);
@@ -125,12 +126,17 @@ class SessionManager {
       }
     });
 
-    // 🔗 STATUS + QR
+    // 🔗 STATUS + QR (CORRIGIDO)
     socket.ev.on("connection.update", async (update) => {
       const { connection, qr } = update;
 
       if (qr) {
-        session.qrcode = qr;
+        try {
+          const qrDataUrl = await QRCode.toDataURL(qr);
+          session.qrcode = qrDataUrl; // ✅ AGORA É IMAGEM
+        } catch (err) {
+          console.error("Erro ao gerar QR:", err.message);
+        }
       }
 
       if (connection === "open") {
@@ -146,8 +152,16 @@ class SessionManager {
 
     // aguarda QR
     return new Promise((resolve) => {
+      const started = Date.now();
+
       const timer = setInterval(() => {
         if (session.qrcode) {
+          clearInterval(timer);
+          resolve(session.qrcode);
+        }
+
+        // fallback 30s
+        if (Date.now() - started > 30000) {
           clearInterval(timer);
           resolve(session.qrcode);
         }
