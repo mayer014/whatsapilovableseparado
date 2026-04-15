@@ -40,7 +40,7 @@ class SessionManager {
       qrcode: null,
 
       messages: new Map(),
-      messageIndex: new Map(), // ⚡ índice rápido
+      messageIndex: new Map(), // ⚡ índice global
     };
 
     this.sessions.set(id, session);
@@ -62,6 +62,7 @@ class SessionManager {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys),
       },
+      printQRInTerminal: false,
     });
 
     session.socket = socket;
@@ -76,7 +77,6 @@ class SessionManager {
         const messageId = msg.key.id || uuidv4();
         const timestamp = Date.now();
 
-        // 🔥 RAW OTIMIZADO (menos memória)
         const rawSafe = {
           key: msg.key,
           message: msg.message,
@@ -88,20 +88,27 @@ class SessionManager {
           rawMessage: rawSafe,
         };
 
-        // salvar por chat
+        // histórico do chat
         const list = session.messages.get(jid) || [];
         list.push(data);
 
-        // limpeza por quantidade
+        // limite por quantidade
         const trimmed = list.slice(-MAX_MESSAGES_PER_CHAT);
 
-        // limpeza por tempo
+        // filtro por tempo
         const now = Date.now();
         const filtered = trimmed.filter(m => now - m.timestamp < MESSAGE_TTL);
 
+        // 🔥 LIMPEZA DO INDEX (CORREÇÃO CRÍTICA)
+        const removedIds = list
+          .slice(0, list.length - filtered.length)
+          .map(m => m.id);
+
+        removedIds.forEach(rid => session.messageIndex.delete(rid));
+
         session.messages.set(jid, filtered);
 
-        // ⚡ index global
+        // index global (lookup O(1))
         session.messageIndex.set(messageId, rawSafe);
       }
     });
@@ -109,7 +116,7 @@ class SessionManager {
     return true;
   }
 
-  // 🚀 DOWNLOAD PRO COM RETRY
+  // 🚀 DOWNLOAD COM RETRY + VALIDAÇÃO
   async downloadMedia(id, messageId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Sessão não encontrada");
@@ -122,7 +129,6 @@ class SessionManager {
 
     const m = rawMsg.message || {};
 
-    // 🛡️ valida se tem mídia
     const hasMedia =
       m.imageMessage ||
       m.audioMessage ||
@@ -136,7 +142,6 @@ class SessionManager {
 
     let buffer = null;
 
-    // 🔁 retry automático
     for (let i = 0; i <= DOWNLOAD_RETRY; i++) {
       try {
         buffer = await downloadMediaMessage(rawMsg, "buffer", {});
