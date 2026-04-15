@@ -24,14 +24,18 @@ class SessionManager {
     }
   }
 
+  // 🔑 Buscar sessão pelo token
   getByToken(token) {
     if (!token) return null;
+
     for (const [, session] of this.sessions) {
       if (session.token === token) return session;
     }
+
     return null;
   }
 
+  // 🆕 Criar instância
   async create() {
     const id = uuidv4();
     const token = uuidv4();
@@ -43,14 +47,15 @@ class SessionManager {
       status: "disconnected",
       qrcode: null,
       phone: null,
-
       messageIndex: new Map(),
     };
 
     this.sessions.set(id, session);
+
     return { id, token };
   }
 
+  // 🔌 Conectar
   async connect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -100,7 +105,11 @@ class SessionManager {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
-        session.qrcode = await QRCode.toDataURL(qr);
+        try {
+          session.qrcode = await QRCode.toDataURL(qr);
+        } catch {
+          session.qrcode = qr; // fallback
+        }
       }
 
       if (connection === "open") {
@@ -130,6 +139,7 @@ class SessionManager {
       }
     });
 
+    // ⏳ aguarda QR
     return new Promise((resolve) => {
       const timer = setInterval(() => {
         if (session.qrcode) {
@@ -140,6 +150,7 @@ class SessionManager {
     });
   }
 
+  // 📊 STATUS
   getStatus(id) {
     const session = this.sessions.get(id);
     if (!session) return { status: "not_found" };
@@ -151,6 +162,34 @@ class SessionManager {
     };
   }
 
+  // 🔌 DESCONECTAR
+  async disconnect(id) {
+    const session = this.sessions.get(id);
+    if (!session) return;
+
+    if (session.socket) {
+      try {
+        await session.socket.logout();
+      } catch {}
+    }
+
+    session.status = "disconnected";
+    session.socket = null;
+    session.qrcode = null;
+  }
+
+  // ❌ REMOVER
+  async remove(id) {
+    await this.disconnect(id);
+    this.sessions.delete(id);
+
+    const sessionDir = path.join(SESSIONS_DIR, id);
+    if (fs.existsSync(sessionDir)) {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  }
+
+  // 💬 ENVIO (🔥 CORRIGIDO)
   async sendMessage(id, { phone, message }) {
     const session = this.sessions.get(id);
 
@@ -158,24 +197,26 @@ class SessionManager {
       throw new Error("Instance not connected");
     }
 
-    if (session.status !== "connected") {
-      throw new Error("Instance not ready");
-    }
-
     const clean = String(phone).replace(/\D/g, "");
     const jid = `${clean}@s.whatsapp.net`;
 
-    const sent = await session.socket.sendMessage(jid, {
-      text: message,
-    });
+    try {
+      const sent = await session.socket.sendMessage(jid, {
+        text: message,
+      });
 
-    return {
-      messageId: sent?.key?.id || null,
-      to: jid,
-      success: true,
-    };
+      return {
+        messageId: sent?.key?.id || null,
+        to: jid,
+        success: true,
+      };
+    } catch (err) {
+      console.error("❌ ERRO AO ENVIAR:", err);
+      throw new Error("Falha ao enviar mensagem");
+    }
   }
 
+  // 🖼️ DOWNLOAD DE MÍDIA
   async downloadMedia(id, messageId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Sessão não encontrada");
@@ -183,13 +224,17 @@ class SessionManager {
     const rawMsg = session.messageIndex.get(messageId);
     if (!rawMsg) return { found: false };
 
-    const buffer = await downloadMediaMessage(rawMsg, "buffer", {});
+    try {
+      const buffer = await downloadMediaMessage(rawMsg, "buffer", {});
 
-    return {
-      found: true,
-      buffer,
-      mimetype: "application/octet-stream",
-    };
+      return {
+        found: true,
+        buffer,
+        mimetype: "application/octet-stream",
+      };
+    } catch (err) {
+      return { found: false };
+    }
   }
 }
 
