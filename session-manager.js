@@ -12,6 +12,7 @@ const QRCode = require("qrcode");
 const pino = require("pino");
 const path = require("path");
 const fs = require("fs");
+const axios = require("axios");
 
 const SESSIONS_DIR = path.join(process.cwd(), "sessions");
 
@@ -24,18 +25,14 @@ class SessionManager {
     }
   }
 
-  // 🔑 Buscar sessão pelo token
   getByToken(token) {
     if (!token) return null;
-
     for (const [, session] of this.sessions) {
       if (session.token === token) return session;
     }
-
     return null;
   }
 
-  // 🆕 Criar instância
   async create() {
     const id = uuidv4();
     const token = uuidv4();
@@ -47,15 +44,15 @@ class SessionManager {
       status: "disconnected",
       qrcode: null,
       phone: null,
+      webhook: null,
+
       messageIndex: new Map(),
     };
 
     this.sessions.set(id, session);
-
     return { id, token };
   }
 
-  // 🔌 Conectar
   async connect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -72,8 +69,8 @@ class SessionManager {
         keys: makeCacheableSignalKeyStore(state.keys),
       },
       browser: ["Ubuntu", "Chrome", "20.0.04"],
-      printQRInTerminal: false,
       markOnlineOnConnect: true,
+      printQRInTerminal: false,
     });
 
     session.socket = socket;
@@ -81,7 +78,7 @@ class SessionManager {
 
     socket.ev.on("creds.update", saveCreds);
 
-    // 📩 RECEBER MENSAGENS
+    // 🔥 RECEBIMENTO + WEBHOOK
     socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const msg of messages) {
         if (!msg.message) continue;
@@ -91,25 +88,40 @@ class SessionManager {
 
         const messageId = msg.key.id;
 
+        const text =
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          "";
+
         session.messageIndex.set(messageId, {
           key: msg.key,
           message: msg.message,
         });
 
-        console.log("📩 Nova mensagem recebida");
+        console.log("📩 Nova mensagem:", text);
+
+        // 🔥 WEBHOOK (ESSENCIAL)
+        if (session.webhook) {
+          try {
+            await axios.post(session.webhook, {
+              event: "message",
+              instanceId: session.id,
+              from: jid,
+              messageId,
+              text,
+            });
+          } catch (err) {
+            console.log("⚠️ Falha webhook:", err.message);
+          }
+        }
       }
     });
 
-    // 🔗 STATUS + QR
     socket.ev.on("connection.update", async (update) => {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
-        try {
-          session.qrcode = await QRCode.toDataURL(qr);
-        } catch {
-          session.qrcode = qr; // fallback
-        }
+        session.qrcode = await QRCode.toDataURL(qr);
       }
 
       if (connection === "open") {
@@ -139,7 +151,6 @@ class SessionManager {
       }
     });
 
-    // ⏳ aguarda QR
     return new Promise((resolve) => {
       const timer = setInterval(() => {
         if (session.qrcode) {
@@ -150,7 +161,6 @@ class SessionManager {
     });
   }
 
-  // 📊 STATUS
   getStatus(id) {
     const session = this.sessions.get(id);
     if (!session) return { status: "not_found" };
@@ -162,34 +172,6 @@ class SessionManager {
     };
   }
 
-  // 🔌 DESCONECTAR
-  async disconnect(id) {
-    const session = this.sessions.get(id);
-    if (!session) return;
-
-    if (session.socket) {
-      try {
-        await session.socket.logout();
-      } catch {}
-    }
-
-    session.status = "disconnected";
-    session.socket = null;
-    session.qrcode = null;
-  }
-
-  // ❌ REMOVER
-  async remove(id) {
-    await this.disconnect(id);
-    this.sessions.delete(id);
-
-    const sessionDir = path.join(SESSIONS_DIR, id);
-    if (fs.existsSync(sessionDir)) {
-      fs.rmSync(sessionDir, { recursive: true, force: true });
-    }
-  }
-
-  // 💬 ENVIO (🔥 CORRIGIDO)
   async sendMessage(id, { phone, message }) {
     const session = this.sessions.get(id);
 
@@ -200,41 +182,35 @@ class SessionManager {
     const clean = String(phone).replace(/\D/g, "");
     const jid = `${clean}@s.whatsapp.net`;
 
-    try {
-      const sent = await session.socket.sendMessage(jid, {
-        text: message,
-      });
+    const sent = await session.socket.sendMessage(jid, {
+      text: message,
+    });
 
-      return {
-        messageId: sent?.key?.id || null,
-        to: jid,
-        success: true,
-      };
-    } catch (err) {
-      console.error("❌ ERRO AO ENVIAR:", err);
-      throw new Error("Falha ao enviar mensagem");
-    }
+    return {
+      success: true,
+      messageId: sent?.key?.id || null,
+    };
   }
 
-  // 🖼️ DOWNLOAD DE MÍDIA
+  setWebhook(id, url) {
+    const session = this.sessions.get(id);
+    session.webhook = url;
+    return { webhook: url };
+  }
+
   async downloadMedia(id, messageId) {
     const session = this.sessions.get(id);
-    if (!session) throw new Error("Sessão não encontrada");
-
     const rawMsg = session.messageIndex.get(messageId);
+
     if (!rawMsg) return { found: false };
 
-    try {
-      const buffer = await downloadMediaMessage(rawMsg, "buffer", {});
+    const buffer = await downloadMediaMessage(rawMsg, "buffer", {});
 
-      return {
-        found: true,
-        buffer,
-        mimetype: "application/octet-stream",
-      };
-    } catch (err) {
-      return { found: false };
-    }
+    return {
+      found: true,
+      buffer,
+      mimetype: "application/octet-stream",
+    };
   }
 }
 
