@@ -29,6 +29,9 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || process.env.WHATSAPI_ADMIN_TOKEN;
 const SESSIONS_DIR =
   process.env.SESSIONS_DIR || path.join(process.cwd(), "sessions");
+// URL pública do motor — usada para montar mediaUrl absoluto no webhook
+// Ex.: https://motor.seudominio.com (sem barra no final)
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
 
 if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -232,7 +235,12 @@ class SessionManager {
         const m = msg.message;
         const messageType = detectMessageType(m);
         const isMedia = messageType !== "text" && messageType !== "location" && messageType !== "contact";
-        const mediaUrl = isMedia ? `/media/${messageId}` : null;
+        // mediaUrl absoluto + token de instância em query (consumer baixa direto do motor)
+        const mediaUrl = isMedia
+          ? (PUBLIC_URL
+              ? `${PUBLIC_URL}/media/${messageId}?t=${encodeURIComponent(session.token)}`
+              : `/media/${messageId}`)
+          : null;
         const meta = extractMediaMeta(m, messageType);
 
         session.messageIndex.set(messageId, {
@@ -318,124 +326,82 @@ class SessionManager {
           const attempts = (this.reconnectAttempts.get(id) || 0) + 1;
           this.reconnectAttempts.set(id, attempts);
           const delay = Math.min(3000 * Math.pow(2, attempts - 1), 60000);
-
-          console.log(`🔄 [${id}] Reconectando em ${delay / 1000}s (tentativa ${attempts})`);
-          session.status = "connecting";
+          console.log(`🔄 [${id}] Tentativa #${attempts} em ${delay}ms...`);
           setTimeout(() => {
             this.connect(id).catch((err) =>
-              console.log(`⚠️ [${id}] Erro na reconexão: ${err.message}`)
+              console.log(`⚠️ [${id}] Reconexão falhou: ${err.message}`)
             );
           }, delay);
         } else {
-          session.status = "disconnected";
-          console.log(`❌ [${id}] Reconexão automática desativada (ação manual necessária)`);
+          console.log(`⛔ [${id}] Reconexão automática desabilitada (${code})`);
         }
       }
     });
 
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        reject(new Error("Timeout aguardando QR Code (30s)"));
-      }, 30000);
-
-      const timer = setInterval(() => {
-        if (session.qrcode) {
-          clearInterval(timer);
-          clearTimeout(timeout);
-          resolve(session.qrcode);
-        }
-        if (session.status === "connected") {
-          clearInterval(timer);
-          clearTimeout(timeout);
-          resolve(null);
-        }
-      }, 500);
-    });
+    return { id };
   }
 
   async disconnect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
-
     if (session.socket) {
-      try { await session.socket.logout(); }
-      catch (_) {
-        try { session.socket.end(); } catch (_) {}
-      }
+      try { await session.socket.logout(); } catch {}
+      session.socket = null;
     }
-
-    session.socket = null;
     session.status = "disconnected";
-    session.qrcode = null;
-    session.phone = null;
-    this.reconnectAttempts.set(id, 0);
-
-    const sessionDir = path.join(SESSIONS_DIR, id);
-    if (fs.existsSync(sessionDir)) {
-      const files = fs.readdirSync(sessionDir);
-      for (const f of files) {
-        if (f !== "_meta.json") {
-          fs.rmSync(path.join(sessionDir, f), { recursive: true, force: true });
-        }
-      }
-    }
-
-    console.log(`🔌 [${id}] Desconectado manualmente`);
+    return { id };
   }
 
-  getStatus(id) {
+  status(id) {
     const session = this.sessions.get(id);
-    if (!session) return { status: "not_found" };
+    if (!session) throw new Error("Session not found");
     return {
+      id: session.id,
       status: session.status,
-      phone: session.phone,
       qrcode: session.qrcode,
+      phone: session.phone,
       lastDisconnectReason: session.lastDisconnectReason,
     };
   }
 
-  async sendMessage(id, { phone, message }) {
+  async send(id, phoneRaw, message) {
     const session = this.sessions.get(id);
-    if (!session?.socket) throw new Error("Instance not connected");
-
-    const clean = String(phone).replace(/\D/g, "");
-    if (!clean || clean.length < 10) {
-      throw new Error("Número inválido: " + phone);
+    if (!session) throw new Error("Session not found");
+    if (session.status !== "connected" || !session.socket) {
+      throw new Error("Instance not connected");
     }
 
-    let targetJid;
+    const phone = String(phoneRaw || "").replace(/\D/g, "");
+
+    if (!phone.startsWith("55") || phone.length < 12 || phone.length > 13) {
+      throw new Error(
+        `Número inválido: "${phoneRaw}". Use formato 55 + DDD + número (ex: 5567999999999)`
+      );
+    }
+
+    const targetJid = `${phone}@s.whatsapp.net`;
+    let sent = null;
+    let delivered = false;
+
     try {
-      const [result] = await session.socket.onWhatsApp(clean);
-
-      if (!result || !result.exists) {
-        const alt = tryBrazilianAlternative(clean);
-        if (alt) {
-          const [altResult] = await session.socket.onWhatsApp(alt);
-          if (!altResult || !altResult.exists) {
-            throw new Error(`Número ${clean} não encontrado (tentou ${alt} também)`);
-          }
-          targetJid = altResult.jid;
-          console.log(`📱 Corrigido: ${clean} → ${alt} (JID: ${targetJid})`);
-        } else {
-          throw new Error(`Número ${clean} não encontrado no WhatsApp`);
-        }
-      } else {
-        targetJid = result.jid;
-      }
+      sent = await session.socket.sendMessage(targetJid, { text: String(message) });
+      delivered = !!sent?.key?.id;
     } catch (err) {
-      if (err.message.includes("não encontrado")) throw err;
-      console.log(`⚠️ onWhatsApp falhou, tentando direto: ${err.message}`);
-      targetJid = `${clean}@s.whatsapp.net`;
+      console.log(`⚠️ [${id}] Envio inicial falhou: ${err.message}`);
     }
 
-    const sent = await session.socket.sendMessage(targetJid, { text: message });
-    const delivered = !!(sent?.key?.id);
-
-    if (sent?.key?.id) {
-      session.messageIndex.set(sent.key.id, {
-        key: sent.key,
-        message: sent.message,
-      });
+    if (!delivered) {
+      const alt = tryBrazilianAlternative(phone);
+      if (alt) {
+        try {
+          const altJid = `${alt}@s.whatsapp.net`;
+          console.log(`🔁 [${id}] Tentando alternativa BR: ${alt}`);
+          sent = await session.socket.sendMessage(altJid, { text: String(message) });
+          delivered = !!sent?.key?.id;
+        } catch (err) {
+          console.log(`⚠️ [${id}] Alternativa falhou: ${err.message}`);
+        }
+      }
     }
 
     return {
@@ -523,7 +489,10 @@ function requireAdmin(req, res, next) {
 }
 
 function requireInstance(req, res, next) {
-  const token = req.headers["x-instance-token"];
+  // Aceita token via header (X-Instance-Token) OU via query string (?t=...)
+  // O fallback por query string é usado pelo webhook para que o consumer
+  // possa baixar mídia (img/audio) direto via <img src> sem custom headers
+  const token = req.headers["x-instance-token"] || req.query.t;
   const session = sessions.getByToken(token);
   if (!session) {
     return res.status(401).json({ success: false, error: "Invalid instance token" });
@@ -539,20 +508,19 @@ app.get("/system/metrics", (_, res) => {
   res.json({
     uptime: process.uptime(),
     memory: {
-      rss: Math.round(mem.rss / 1024 / 1024),
-      heapUsed: Math.round(mem.heapUsed / 1024 / 1024),
-      heapTotal: Math.round(mem.heapTotal / 1024 / 1024),
+      rss: mem.rss,
+      heapTotal: mem.heapTotal,
+      heapUsed: mem.heapUsed,
     },
-    cpu: os.loadavg(),
-    sessions: sessions.sessions.size,
-    connectedSessions: Array.from(sessions.sessions.values())
-      .filter((s) => s.status === "connected").length,
+    loadavg: os.loadavg(),
+    sessions: sessions.listAll().length,
   });
 });
 
 app.post("/instance/create", requireAdmin, async (req, res) => {
   try {
-    const result = await sessions.create();
+    const { id, token } = req.body || {};
+    const result = await sessions.create({ id, token });
     res.json({ success: true, ...result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -565,8 +533,8 @@ app.get("/instance/list", requireAdmin, (_, res) => {
 
 app.post("/connect", requireInstance, async (req, res) => {
   try {
-    const qr = await sessions.connect(req.session.id);
-    res.json({ success: true, qrcode: qr, status: req.session.status });
+    const result = await sessions.connect(req.session.id);
+    res.json({ success: true, ...result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -574,33 +542,35 @@ app.post("/connect", requireInstance, async (req, res) => {
 
 app.post("/disconnect", requireInstance, async (req, res) => {
   try {
-    await sessions.disconnect(req.session.id);
-    res.json({ success: true });
+    const result = await sessions.disconnect(req.session.id);
+    res.json({ success: true, ...result });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.get("/status", requireInstance, (req, res) => {
-  res.json({ success: true, ...sessions.getStatus(req.session.id) });
+  res.json({ success: true, ...sessions.status(req.session.id) });
 });
 
 app.post("/send", requireInstance, async (req, res) => {
   try {
-    const result = await sessions.sendMessage(req.session.id, req.body);
-    res.json({ success: true, ...result });
+    const { phone, message } = req.body || {};
+    const result = await sessions.send(req.session.id, phone, message);
+    res.json(result);
   } catch (err) {
-    res.status(400).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
 app.post("/webhook", requireInstance, (req, res) => {
   try {
-    const { url } = req.body;
+    const { url } = req.body || {};
+    if (!url) return res.status(400).json({ success: false, error: "url required" });
     const result = sessions.setWebhook(req.session.id, url);
     res.json({ success: true, ...result });
   } catch (err) {
-    res.status(400).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
