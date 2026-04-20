@@ -1,10 +1,10 @@
 // ============================================================================
 // WhatsHub Engine v2.1 - Motor Baileys com Persistência + Mídia + Validação BR
 // ----------------------------------------------------------------------------
-// Junta o melhor de duas versões:
-//  - v2: persistência via volume, reconexão inteligente, keep-alive, métricas
-//  - session-manager original: validação 9º dígito BR, download de mídia,
-//    webhook completo, índice de mensagens
+// v3 — Contrato completo de mídia no webhook:
+//   - pushName, fromMe, isPtt
+//   - mediaMimeType, mediaFileName, mediaSizeBytes, mediaDurationSeconds
+//   - GET /media/:messageId enriquecido (Content-Disposition com filename real)
 // ============================================================================
 
 const express = require("express");
@@ -34,14 +34,55 @@ if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
+// ---------- Helpers de extração de metadata de mídia (contrato v2.1) ----------
+function detectMessageType(m) {
+  if (m.imageMessage) return "image";
+  if (m.videoMessage) return "video";
+  if (m.audioMessage) return "audio";
+  if (m.documentMessage) return "document";
+  if (m.documentWithCaptionMessage) return "document";
+  if (m.stickerMessage) return "sticker";
+  if (m.locationMessage) return "location";
+  if (m.contactMessage) return "contact";
+  return "text";
+}
+
+function extractMediaMeta(m, messageType) {
+  if (messageType === "text" || messageType === "location" || messageType === "contact") {
+    return {
+      mediaMimeType: null,
+      mediaFileName: null,
+      mediaSizeBytes: null,
+      mediaDurationSeconds: null,
+      isPtt: false,
+    };
+  }
+
+  const docMsg = m.documentMessage || m.documentWithCaptionMessage?.message?.documentMessage;
+  const node =
+    m.imageMessage ||
+    m.videoMessage ||
+    m.audioMessage ||
+    docMsg ||
+    m.stickerMessage ||
+    {};
+
+  return {
+    mediaMimeType: node.mimetype || null,
+    mediaFileName: docMsg?.fileName || node.fileName || null,
+    mediaSizeBytes: node.fileLength ? Number(node.fileLength) : null,
+    mediaDurationSeconds: node.seconds || null,
+    isPtt: !!(m.audioMessage && m.audioMessage.ptt),
+  };
+}
+
 // ---------- Gerenciador de Sessões ----------
 class SessionManager {
   constructor() {
-    this.sessions = new Map();        // id -> session
-    this.reconnectAttempts = new Map(); // id -> contador de tentativas
+    this.sessions = new Map();
+    this.reconnectAttempts = new Map();
   }
 
-  // Busca sessão pelo token de instância (usado em rotas autenticadas)
   getByToken(token) {
     if (!token) return null;
     for (const [, s] of this.sessions) {
@@ -50,7 +91,6 @@ class SessionManager {
     return null;
   }
 
-  // Cria uma nova sessão (ainda sem conectar)
   async create(opts = {}) {
     const id = opts.id || uuidv4();
     const token = opts.token || uuidv4();
@@ -63,7 +103,7 @@ class SessionManager {
       qrcode: null,
       phone: null,
       webhook: null,
-      messageIndex: new Map(),   // messageId -> { key, message }
+      messageIndex: new Map(),
       lastDisconnectReason: null,
       createdAt: new Date().toISOString(),
     };
@@ -73,7 +113,6 @@ class SessionManager {
     return { id, token };
   }
 
-  // Grava metadados da sessão para recuperação no boot
   _persistMeta(session) {
     const dir = path.join(SESSIONS_DIR, session.id);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -88,7 +127,6 @@ class SessionManager {
     );
   }
 
-  // Recupera todas as sessões persistidas no boot
   async recoverPersistedSessions() {
     if (!fs.existsSync(SESSIONS_DIR)) return;
     const dirs = fs.readdirSync(SESSIONS_DIR).filter((d) =>
@@ -119,7 +157,6 @@ class SessionManager {
         };
         this.sessions.set(id, session);
 
-        // Só reconecta automaticamente se tiver credenciais salvas
         if (fs.existsSync(credsPath)) {
           console.log(`   → Reconectando ${id}...`);
           this.connect(id).catch((err) =>
@@ -134,20 +171,17 @@ class SessionManager {
     }
   }
 
-  // Decide se deve reconectar baseado no motivo da desconexão
   _decideReconnect(code) {
-    // Códigos que NUNCA devem reconectar automaticamente (exigem ação manual)
     const manual = [
-      DisconnectReason.loggedOut,          // 401 - deslogado
-      DisconnectReason.connectionReplaced, // 440 - conexão duplicada
-      DisconnectReason.badSession,         // arquivo de sessão corrompido
+      DisconnectReason.loggedOut,
+      DisconnectReason.connectionReplaced,
+      DisconnectReason.badSession,
       DisconnectReason.multideviceMismatch,
     ];
     if (manual.includes(code)) return false;
     return true;
   }
 
-  // Conecta (ou reconecta) uma sessão ao WhatsApp
   async connect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -166,8 +200,8 @@ class SessionManager {
       browser: ["Ubuntu", "Chrome", "20.0.04"],
       markOnlineOnConnect: true,
       printQRInTerminal: false,
-      keepAliveIntervalMs: 30000,             // evita timeout em proxies
-      shouldSyncHistoryMessage: () => false,  // reduz consumo de RAM
+      keepAliveIntervalMs: 30000,
+      shouldSyncHistoryMessage: () => false,
       syncFullHistory: false,
     });
 
@@ -176,7 +210,7 @@ class SessionManager {
 
     socket.ev.on("creds.update", saveCreds);
 
-    // ------- Mensagens recebidas/enviadas + Webhook -------
+    // ------- Mensagens recebidas/enviadas + Webhook (contrato v2.1 COMPLETO) -------
     socket.ev.on("messages.upsert", async ({ messages }) => {
       for (const msg of messages) {
         if (!msg.message) continue;
@@ -185,26 +219,36 @@ class SessionManager {
         if (!jid || jid === "status@broadcast") continue;
 
         const messageId = msg.key.id;
+
         const text =
           msg.message.conversation ||
           msg.message.extendedTextMessage?.text ||
+          msg.message.imageMessage?.caption ||
+          msg.message.videoMessage?.caption ||
+          msg.message.documentMessage?.caption ||
+          msg.message.documentWithCaptionMessage?.message?.documentMessage?.caption ||
           "";
 
-        // Guarda no índice para permitir download de mídia depois
+        const m = msg.message;
+        const messageType = detectMessageType(m);
+        const isMedia = messageType !== "text" && messageType !== "location" && messageType !== "contact";
+        const mediaUrl = isMedia ? `/media/${messageId}` : null;
+        const meta = extractMediaMeta(m, messageType);
+
         session.messageIndex.set(messageId, {
           key: msg.key,
           message: msg.message,
         });
 
-        // Limita o tamanho do índice (evita memory leak) - mantém últimas 1000
         if (session.messageIndex.size > 1000) {
           const firstKey = session.messageIndex.keys().next().value;
           session.messageIndex.delete(firstKey);
         }
 
-        console.log(`📩 [${id}] ${msg.key.fromMe ? "→" : "←"} ${jid}: ${text.slice(0, 50)}`);
+        console.log(
+          `📩 [${id}] ${msg.key.fromMe ? "→" : "←"} ${jid} (${messageType}${meta.isPtt ? "/ptt" : ""}): ${text.slice(0, 50)}`
+        );
 
-        // Envia para o webhook configurado
         if (session.webhook) {
           try {
             await axios.post(session.webhook, {
@@ -213,7 +257,17 @@ class SessionManager {
               from: jid,
               fromMe: msg.key.fromMe || false,
               messageId,
+              pushName: msg.pushName || null,
+              timestamp: msg.messageTimestamp || Math.floor(Date.now() / 1000),
+              messageType,
               text,
+              message: text,
+              mediaUrl,
+              mediaMimeType: meta.mediaMimeType,
+              mediaFileName: meta.mediaFileName,
+              mediaSizeBytes: meta.mediaSizeBytes,
+              mediaDurationSeconds: meta.mediaDurationSeconds,
+              isPtt: meta.isPtt,
             }, { timeout: 10000 });
           } catch (err) {
             console.log(`⚠️ [${id}] Falha webhook: ${err.message}`);
@@ -222,23 +276,30 @@ class SessionManager {
       }
     });
 
-    // ------- Atualizações de conexão -------
     socket.ev.on("connection.update", async (update) => {
       const { connection, qr, lastDisconnect } = update;
 
       if (qr) {
         session.qrcode = await QRCode.toDataURL(qr);
-        console.log(`📷 [${id}] QR Code gerado`);
+        console.log(`📷 [${id}] QR Code gerado (expira em 60s)`);
+        if (session.qrTimeout) clearTimeout(session.qrTimeout);
+        session.qrTimeout = setTimeout(() => {
+          if (session.status !== "connected") {
+            session.qrcode = null;
+            console.log(`⌛ [${id}] QR Code expirado (60s sem leitura)`);
+          }
+        }, 60_000);
       }
 
       if (connection === "open") {
         session.status = "connected";
         session.qrcode = null;
+        if (session.qrTimeout) { clearTimeout(session.qrTimeout); session.qrTimeout = null; }
         session.lastDisconnectReason = null;
         this.reconnectAttempts.set(id, 0);
 
         const jid = socket.user?.id;
-        if (jid) session.phone = jid.split("@")[0];
+        if (jid) session.phone = jid.split("@")[0].split(":")[0];
 
         console.log(`✅ [${id}] Conectado: ${session.phone}`);
       }
@@ -256,8 +317,6 @@ class SessionManager {
         if (shouldReconnect) {
           const attempts = (this.reconnectAttempts.get(id) || 0) + 1;
           this.reconnectAttempts.set(id, attempts);
-
-          // Backoff exponencial: 3s, 6s, 12s, 24s, 48s (máx 60s)
           const delay = Math.min(3000 * Math.pow(2, attempts - 1), 60000);
 
           console.log(`🔄 [${id}] Reconectando em ${delay / 1000}s (tentativa ${attempts})`);
@@ -274,7 +333,6 @@ class SessionManager {
       }
     });
 
-    // Aguarda QR ou conexão direta (quando credenciais já existem)
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error("Timeout aguardando QR Code (30s)"));
@@ -295,7 +353,6 @@ class SessionManager {
     });
   }
 
-  // Desconecta manualmente e limpa credenciais (força novo QR)
   async disconnect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -313,10 +370,8 @@ class SessionManager {
     session.phone = null;
     this.reconnectAttempts.set(id, 0);
 
-    // Remove credenciais para forçar novo QR
     const sessionDir = path.join(SESSIONS_DIR, id);
     if (fs.existsSync(sessionDir)) {
-      // Mantém _meta.json, remove o resto
       const files = fs.readdirSync(sessionDir);
       for (const f of files) {
         if (f !== "_meta.json") {
@@ -339,7 +394,6 @@ class SessionManager {
     };
   }
 
-  // Envia mensagem com validação do 9º dígito BR
   async sendMessage(id, { phone, message }) {
     const session = this.sessions.get(id);
     if (!session?.socket) throw new Error("Instance not connected");
@@ -354,7 +408,6 @@ class SessionManager {
       const [result] = await session.socket.onWhatsApp(clean);
 
       if (!result || !result.exists) {
-        // Tenta variante com/sem 9º dígito
         const alt = tryBrazilianAlternative(clean);
         if (alt) {
           const [altResult] = await session.socket.onWhatsApp(alt);
@@ -378,7 +431,6 @@ class SessionManager {
     const sent = await session.socket.sendMessage(targetJid, { text: message });
     const delivered = !!(sent?.key?.id);
 
-    // Também guarda no índice (caso seja mídia futuramente)
     if (sent?.key?.id) {
       session.messageIndex.set(sent.key.id, {
         key: sent.key,
@@ -402,7 +454,7 @@ class SessionManager {
     return { webhook: url };
   }
 
-  // Baixa mídia de uma mensagem guardada no índice
+  // Baixa mídia + retorna metadata (mimetype + filename real)
   async downloadMedia(id, messageId) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -413,16 +465,20 @@ class SessionManager {
     try {
       const buffer = await downloadMediaMessage(rawMsg, "buffer", {});
       const m = rawMsg.message || {};
+      const docMsg = m.documentMessage || m.documentWithCaptionMessage?.message?.documentMessage;
+      const node =
+        m.imageMessage ||
+        m.videoMessage ||
+        m.audioMessage ||
+        docMsg ||
+        m.stickerMessage ||
+        {};
+
       return {
         found: true,
         buffer,
-        mimetype:
-          m.imageMessage?.mimetype ||
-          m.videoMessage?.mimetype ||
-          m.audioMessage?.mimetype ||
-          m.documentMessage?.mimetype ||
-          m.stickerMessage?.mimetype ||
-          "application/octet-stream",
+        mimetype: node.mimetype || "application/octet-stream",
+        filename: docMsg?.fileName || node.fileName || null,
       };
     } catch (err) {
       console.log(`⚠️ [${id}] Erro ao baixar mídia: ${err.message}`);
@@ -430,7 +486,6 @@ class SessionManager {
     }
   }
 
-  // Lista todas as instâncias (admin)
   listAll() {
     return Array.from(this.sessions.values()).map((s) => ({
       id: s.id,
@@ -443,7 +498,6 @@ class SessionManager {
   }
 }
 
-// Alternativa do 9º dígito para números brasileiros
 function tryBrazilianAlternative(phone) {
   if (!phone.startsWith("55")) return null;
   const ddd = phone.substring(2, 4);
@@ -460,18 +514,16 @@ const sessions = new SessionManager();
 const app = express();
 app.use(express.json({ limit: "50mb" }));
 
-// --- Middleware: autenticação de admin (master token) ---
 function requireAdmin(req, res, next) {
-  const token = req.headers["x-admin-token"] || req.query.admin_token;
+  const token = req.headers["x-admin-token"];
   if (!ADMIN_TOKEN || token !== ADMIN_TOKEN) {
     return res.status(401).json({ success: false, error: "Invalid admin token" });
   }
   next();
 }
 
-// --- Middleware: autenticação por instance token ---
 function requireInstance(req, res, next) {
-  const token = req.headers["x-instance-token"] || req.query.instance_token;
+  const token = req.headers["x-instance-token"];
   const session = sessions.getByToken(token);
   if (!session) {
     return res.status(401).json({ success: false, error: "Invalid instance token" });
@@ -480,7 +532,6 @@ function requireInstance(req, res, next) {
   next();
 }
 
-// ---------- Health & métricas ----------
 app.get("/health", (_, res) => res.json({ ok: true, version: "2.1" }));
 
 app.get("/system/metrics", (_, res) => {
@@ -499,7 +550,6 @@ app.get("/system/metrics", (_, res) => {
   });
 });
 
-// ---------- Admin: gerenciamento de instâncias ----------
 app.post("/instance/create", requireAdmin, async (req, res) => {
   try {
     const result = await sessions.create();
@@ -513,7 +563,6 @@ app.get("/instance/list", requireAdmin, (_, res) => {
   res.json({ success: true, instances: sessions.listAll() });
 });
 
-// ---------- Instance: rotas autenticadas por instance token ----------
 app.post("/connect", requireInstance, async (req, res) => {
   try {
     const qr = await sessions.connect(req.session.id);
@@ -555,7 +604,8 @@ app.post("/webhook", requireInstance, (req, res) => {
   }
 });
 
-// Download de mídia pelo messageId
+// Download de mídia pelo messageId (autenticado por x-instance-token)
+// Retorna o binário com Content-Type correto e Content-Disposition com filename real
 app.get("/media/:messageId", requireInstance, async (req, res) => {
   try {
     const result = await sessions.downloadMedia(
@@ -569,7 +619,12 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
       });
     }
     res.set("Content-Type", result.mimetype);
-    res.set("Content-Disposition", "inline");
+    if (result.filename) {
+      const safe = String(result.filename).replace(/["\r\n]/g, "");
+      res.set("Content-Disposition", `inline; filename="${safe}"`);
+    } else {
+      res.set("Content-Disposition", "inline");
+    }
     res.set("Cache-Control", "public, max-age=3600");
     res.send(result.buffer);
   } catch (err) {
@@ -577,7 +632,6 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
   }
 });
 
-// ---------- Boot ----------
 app.listen(PORT, async () => {
   console.log(`🚀 WhatsHub Engine v2.1 online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
