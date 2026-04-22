@@ -257,12 +257,27 @@ class SessionManager {
           `📩 [${id}] ${msg.key.fromMe ? "→" : "←"} ${jid} (${messageType}${meta.isPtt ? "/ptt" : ""}): ${text.slice(0, 50)}`
         );
 
+        // ── Resolução de número real (LID → PN) ──
+        // Em chats modernos, msg.key.remoteJid pode ser "<id>@lid" (identificador interno).
+        // Baileys expõe o telefone real em senderPn/participantPn (PN = Phone Number JID).
+        // Enviamos todos os campos para o relay reconstruir o "from" verdadeiro.
+        const senderPn = msg.key.senderPn || null;
+        const participantPn = msg.key.participantPn || null;
+        const remoteJidAlt = (jid && jid.endsWith("@lid"))
+          ? (senderPn || participantPn || null)
+          : null;
+        const realFrom = senderPn || participantPn || jid;
+
         if (session.webhook) {
           try {
             await axios.post(session.webhook, {
               event: "message",
               instanceId: session.id,
-              from: jid,
+              from: realFrom,
+              rawJid: jid,
+              senderPn,
+              participantPn,
+              remoteJidAlt,
               fromMe: msg.key.fromMe || false,
               messageId,
               pushName: msg.pushName || null,
