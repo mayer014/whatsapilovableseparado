@@ -84,6 +84,7 @@ class SessionManager {
   constructor() {
     this.sessions = new Map();
     this.reconnectAttempts = new Map();
+    this.reconnectTimers = new Map();
   }
 
   getByToken(token) {
@@ -108,6 +109,7 @@ class SessionManager {
       webhook: null,
       messageIndex: new Map(),
       lastDisconnectReason: null,
+      qrRetries: 0,
       createdAt: new Date().toISOString(),
     };
 
@@ -156,6 +158,7 @@ class SessionManager {
           webhook: meta.webhook || null,
           messageIndex: new Map(),
           lastDisconnectReason: null,
+          qrRetries: 0,
           createdAt: meta.createdAt,
         };
         this.sessions.set(id, session);
@@ -174,20 +177,31 @@ class SessionManager {
     }
   }
 
-  _decideReconnect(code) {
+  _decideReconnect(code, reason = "") {
     const manual = [
       DisconnectReason.loggedOut,
       DisconnectReason.connectionReplaced,
       DisconnectReason.badSession,
       DisconnectReason.multideviceMismatch,
+      DisconnectReason.timedOut,
     ];
+    const text = String(reason || "").toLowerCase();
     if (manual.includes(code)) return false;
+    if (text.includes("qr refs attempts ended") || text.includes("qr") || code === 408) return false;
     return true;
+  }
+
+  _clearReconnectTimer(id) {
+    const timer = this.reconnectTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.reconnectTimers.delete(id);
   }
 
   async connect(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
+
+    this._clearReconnectTimer(id);
 
     const sessionDir = path.join(SESSIONS_DIR, id);
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -309,6 +323,8 @@ class SessionManager {
         session.qrTimeout = setTimeout(() => {
           if (session.status !== "connected") {
             session.qrcode = null;
+            session.status = "disconnected";
+            session.lastDisconnectReason = "QR Code expirado sem leitura";
             console.log(`⌛ [${id}] QR Code expirado (60s sem leitura)`);
           }
         }, 60_000);
@@ -320,6 +336,8 @@ class SessionManager {
         if (session.qrTimeout) { clearTimeout(session.qrTimeout); session.qrTimeout = null; }
         session.lastDisconnectReason = null;
         this.reconnectAttempts.set(id, 0);
+        session.qrRetries = 0;
+        this._clearReconnectTimer(id);
 
         const jid = socket.user?.id;
         if (jid) session.phone = jid.split("@")[0].split(":")[0];
@@ -335,18 +353,20 @@ class SessionManager {
 
         console.log(`🔌 [${id}] Desconectado (${code}): ${reason}`);
 
-        const shouldReconnect = this._decideReconnect(code);
+        const shouldReconnect = this._decideReconnect(code, reason);
 
         if (shouldReconnect) {
           const attempts = (this.reconnectAttempts.get(id) || 0) + 1;
           this.reconnectAttempts.set(id, attempts);
           const delay = Math.min(3000 * Math.pow(2, attempts - 1), 60000);
           console.log(`🔄 [${id}] Tentativa #${attempts} em ${delay}ms...`);
-          setTimeout(() => {
+          const timer = setTimeout(() => {
+            this.reconnectTimers.delete(id);
             this.connect(id).catch((err) =>
               console.log(`⚠️ [${id}] Reconexão falhou: ${err.message}`)
             );
           }, delay);
+          this.reconnectTimers.set(id, timer);
         } else {
           console.log(`⛔ [${id}] Reconexão automática desabilitada (${code})`);
         }
@@ -470,8 +490,10 @@ class SessionManager {
   listAll() {
     return Array.from(this.sessions.values()).map((s) => ({
       id: s.id,
-      status: s.status,
+      status: s.lastDisconnectReason ? "disconnected" : s.status,
       phone: s.phone,
+      connected: s.status === "connected" && !!s.socket && !s.lastDisconnectReason,
+      hasSocket: !!s.socket,
       webhook: s.webhook,
       lastDisconnectReason: s.lastDisconnectReason,
       createdAt: s.createdAt,
@@ -622,3 +644,4 @@ app.listen(PORT, async () => {
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
+
