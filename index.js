@@ -1,5 +1,5 @@
 // ============================================================================
-// WhatsHub Engine v2.1 - Motor Baileys com Persistência + Mídia + Validação BR
+// WhatsHub Engine v2.2 - Motor Baileys com Persistência + Mídia + Validação BR
 // ----------------------------------------------------------------------------
 // v3 — Contrato completo de mídia no webhook:
 //   - pushName, fromMe, isPtt
@@ -487,6 +487,34 @@ class SessionManager {
     }
   }
 
+  // Lista grupos da sessão (Baileys groupFetchAllParticipating).
+  // Retorna formato consumido pela bridge: id (@g.us), subject, participants_count, isGroup, isAdmin, announce.
+  async listChats(id) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    if (session.status !== "connected" || !session.socket) {
+      throw new Error("Instance not connected");
+    }
+    const sock = session.socket;
+    const meId = sock.user?.id || null;
+    const meBare = meId ? meId.split(":")[0].split("@")[0] + "@s.whatsapp.net" : null;
+
+    const groupsMap = await sock.groupFetchAllParticipating();
+    return Object.values(groupsMap).map((g) => {
+      const participants = g.participants || [];
+      const meEntry = participants.find((p) => p.id === meId || p.id === meBare);
+      return {
+        id: g.id,
+        subject: g.subject || null,
+        picture: null,
+        participants_count: participants.length,
+        isGroup: true,
+        isAdmin: !!(meEntry && ["admin", "superadmin"].includes(meEntry.admin)),
+        announce: !!g.announce,
+      };
+    });
+  }
+
   listAll() {
     return Array.from(this.sessions.values()).map((s) => ({
       id: s.id,
@@ -538,7 +566,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.1" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.2" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -588,6 +616,17 @@ app.post("/disconnect", requireInstance, async (req, res) => {
 
 app.get("/status", requireInstance, (req, res) => {
   res.json({ success: true, ...sessions.status(req.session.id) });
+});
+
+// GET /chats — lista grupos/conversas da instância (autenticado por x-instance-token)
+// Resposta: array de objetos compatível com a bridge (groups primeiro). 1:1 ainda não suportado.
+app.get("/chats", requireInstance, async (req, res) => {
+  try {
+    const chats = await sessions.listChats(req.session.id);
+    res.json(chats);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post("/send", requireInstance, async (req, res) => {
@@ -640,7 +679,7 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 WhatsHub Engine v2.1 online na porta ${PORT}`);
+  console.log(`🚀 WhatsHub Engine v2.2 online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
