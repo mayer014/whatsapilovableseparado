@@ -1,5 +1,5 @@
 // ============================================================================
-// WhatsHub Engine v2.2 - Motor Baileys com Persistência + Mídia + Validação BR
+// WhatsHub Engine v2.4 - Motor Baileys com Persistência + Mídia + Validação BR
 // ----------------------------------------------------------------------------
 // v3 — Contrato completo de mídia no webhook:
 //   - pushName, fromMe, isPtt
@@ -399,22 +399,56 @@ class SessionManager {
     };
   }
 
-  async send(id, phoneRaw, message) {
+  async send(id, recipientRaw, message) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
     if (session.status !== "connected" || !session.socket) {
       throw new Error("Instance not connected");
     }
 
-    const phone = String(phoneRaw || "").replace(/\D/g, "");
+    const raw = String(recipientRaw || "").trim();
+    if (!raw) throw new Error("Destinatário vazio");
 
-    if (!phone.startsWith("55") || phone.length < 12 || phone.length > 13) {
-      throw new Error(
-        `Número inválido: "${phoneRaw}". Use formato 55 + DDD + número (ex: 5567999999999)`
-      );
+    // ----- Detecção de grupo (@g.us) ou JID já formatado -----
+    // Aceita: "5511999...-1700000000@g.us", "120363xxxxxxxxx@g.us",
+    //         "5511999999999@s.whatsapp.net" ou número puro "5511999999999".
+    const isGroupJid = raw.endsWith("@g.us");
+    const isUserJid = raw.endsWith("@s.whatsapp.net");
+
+    if (isGroupJid) {
+      // Envio para grupo: usa o JID exatamente como recebido (sem normalização BR)
+      try {
+        const sent = await session.socket.sendMessage(raw, { text: String(message) });
+        const delivered = !!sent?.key?.id;
+        if (!delivered) {
+          throw new Error("Envio para grupo não retornou messageId");
+        }
+        console.log(`📤 [${id}] → ${raw} (group): ${String(message).slice(0, 50)}`);
+        return { success: true, delivered: true, messageId: sent.key.id, to: raw, isGroup: true };
+      } catch (err) {
+        console.log(`⚠️ [${id}] Falha envio grupo ${raw}: ${err.message}`);
+        throw new Error(`Falha ao enviar para grupo: ${err.message}`);
+      }
     }
 
-    const targetJid = `${phone}@s.whatsapp.net`;
+    // ----- Envio 1:1 -----
+    let targetJid;
+    let phone;
+
+    if (isUserJid) {
+      // JID já formatado: extrai dígitos para tentativa BR alternativa
+      targetJid = raw;
+      phone = raw.split("@")[0].split(":")[0].replace(/\D/g, "");
+    } else {
+      phone = raw.replace(/\D/g, "");
+      if (!phone.startsWith("55") || phone.length < 12 || phone.length > 13) {
+        throw new Error(
+          `Número inválido: "${recipientRaw}". Use formato 55 + DDD + número (ex: 5567999999999) ou JID @g.us para grupos`
+        );
+      }
+      targetJid = `${phone}@s.whatsapp.net`;
+    }
+
     let sent = null;
     let delivered = false;
 
@@ -425,7 +459,7 @@ class SessionManager {
       console.log(`⚠️ [${id}] Envio inicial falhou: ${err.message}`);
     }
 
-    if (!delivered) {
+    if (!delivered && phone) {
       const alt = tryBrazilianAlternative(phone);
       if (alt) {
         try {
@@ -439,9 +473,13 @@ class SessionManager {
       }
     }
 
+    if (!delivered) {
+      throw new Error("Envio não confirmado pela rede WhatsApp (sem messageId)");
+    }
+
     return {
-      success: delivered,
-      delivered,
+      success: true,
+      delivered: true,
       messageId: sent?.key?.id || null,
       to: targetJid,
     };
@@ -590,7 +628,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.3" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.4" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -655,11 +693,26 @@ app.get("/chats", requireInstance, async (req, res) => {
 
 app.post("/send", requireInstance, async (req, res) => {
   try {
-    const { phone, message } = req.body || {};
-    const result = await sessions.send(req.session.id, phone, message);
+    // Aceita múltiplos aliases para destinatário:
+    //   - phone: número BR puro (1:1)
+    //   - jid / to: JID completo (@s.whatsapp.net ou @g.us)
+    //   - group_jid: JID de grupo (@g.us) — atalho semântico
+    const body = req.body || {};
+    const recipient = body.group_jid || body.jid || body.to || body.phone;
+    const { message } = body;
+    if (!recipient) {
+      return res.status(400).json({ success: false, error: "Missing recipient (phone | jid | to | group_jid)" });
+    }
+    if (!message) {
+      return res.status(400).json({ success: false, error: "Missing message" });
+    }
+    const result = await sessions.send(req.session.id, recipient, message);
     res.json(result);
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    // Erros de envio retornam 400 (cliente) — não 200 vazio
+    const msg = err.message || "send failed";
+    const status = /not connected|Session not found/i.test(msg) ? 409 : 400;
+    res.status(status).json({ success: false, error: msg });
   }
 });
 
@@ -703,8 +756,9 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 WhatsHub Engine v2.2 online na porta ${PORT}`);
+  console.log(`🚀 WhatsHub Engine v2.4 online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
+
 
