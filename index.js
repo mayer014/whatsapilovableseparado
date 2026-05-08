@@ -489,6 +489,9 @@ class SessionManager {
 
   // Lista grupos da sessão (Baileys groupFetchAllParticipating).
   // Retorna formato consumido pela bridge: id (@g.us), subject, participants_count, isGroup, isAdmin, announce.
+  // IMPORTANTE: o JID da sessão (sock.user.id) vem com sufixo de device (ex.: "5567xxx:42@s.whatsapp.net")
+  // e/ou em formato LID (xxx@lid). Os participants[] do grupo podem usar PN ou LID. Por isso normalizamos
+  // para apenas a parte numérica antes de comparar — caso contrário isAdmin sempre cai em false.
   async listChats(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -496,21 +499,42 @@ class SessionManager {
       throw new Error("Instance not connected");
     }
     const sock = session.socket;
-    const meId = sock.user?.id || null;
-    const meBare = meId ? meId.split(":")[0].split("@")[0] + "@s.whatsapp.net" : null;
+
+    // Extrai apenas dígitos de um JID (remove device suffix ":NN", domínio e sufixos LID)
+    const numOnly = (jid) => {
+      if (!jid || typeof jid !== "string") return "";
+      return jid.split("@")[0].split(":")[0].replace(/\D/g, "");
+    };
+
+    const meCandidates = new Set();
+    if (sock.user?.id) meCandidates.add(numOnly(sock.user.id));
+    if (sock.user?.lid) meCandidates.add(numOnly(sock.user.lid));
+    // Alguns builds expõem só o phone
+    if (session.phone) meCandidates.add(numOnly(session.phone));
 
     const groupsMap = await sock.groupFetchAllParticipating();
     return Object.values(groupsMap).map((g) => {
       const participants = g.participants || [];
-      const meEntry = participants.find((p) => p.id === meId || p.id === meBare);
+      // Procura o próprio número entre os participantes comparando por dígitos
+      const meEntry = participants.find((p) => {
+        const candidates = [p.id, p.jid, p.lid, p.phoneNumber].filter(Boolean).map(numOnly);
+        return candidates.some((c) => c && meCandidates.has(c));
+      });
+      const adminFlag = meEntry?.admin; // "admin" | "superadmin" | null
+      const isAdmin = !!(meEntry && (adminFlag === "admin" || adminFlag === "superadmin" || meEntry.isAdmin === true || meEntry.isSuperAdmin === true));
+      const announce = !!(g.announce ?? g.announcement ?? g.restrict);
       return {
         id: g.id,
         subject: g.subject || null,
         picture: null,
         participants_count: participants.length,
         isGroup: true,
-        isAdmin: !!(meEntry && ["admin", "superadmin"].includes(meEntry.admin)),
-        announce: !!g.announce,
+        isAdmin,
+        // Aliases para máxima compatibilidade com a bridge
+        is_admin: isAdmin,
+        iAmAdmin: isAdmin,
+        announce,
+        is_announcement: announce,
       };
     });
   }
@@ -566,7 +590,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.2" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.3" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
