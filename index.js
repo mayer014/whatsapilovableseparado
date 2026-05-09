@@ -1,6 +1,9 @@
 // ============================================================================
-// WhatsHub Engine v2.5 - Motor Baileys com Persistência + Mídia + Chats Completos
+// WhatsHub Engine v2.6 - Motor Baileys + Sincronização Completa de Contatos
 // ----------------------------------------------------------------------------
+// v2.6 — Sincronização completa de contatos (nomes da agenda do celular):
+//   - syncFullHistory: true para Baileys puxar a lista completa de contatos
+//   - Resolve o caso "chat aparece só com número" mesmo com contato salvo
 // v2.5 — Suporte completo a chats 1:1 + grupos + histórico por JID:
 //   - GET /chats devolve 1:1 e grupos com name, lastMessage, unreadCount, picture
 //   - GET /messages/:jid?limit=50 devolve histórico em memória (formato Baileys)
@@ -235,7 +238,7 @@ class SessionManager {
       // Sincroniza histórico recente (chats e mensagens) ao conectar para
       // popular as stores de chats/messages/contacts. Não puxa histórico completo.
       shouldSyncHistoryMessage: () => true,
-      syncFullHistory: false,
+      syncFullHistory: true, // v2.6: necessário para Baileys puxar lista completa de contatos do WhatsApp (nomes da agenda)
     });
 
     session.socket = socket;
@@ -849,7 +852,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.5" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.6" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -1007,6 +1010,7 @@ app.listen(PORT, async () => {
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
+
 
 
 
