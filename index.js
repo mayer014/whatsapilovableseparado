@@ -542,6 +542,60 @@ class SessionManager {
     return { id };
   }
 
+  // ─── Limpeza de sessões órfãs ───────────────────────────────────────────
+  // Encerra socket, remove da memória e apaga a pasta em /app/sessions/<id>.
+  // Usado por /sessions/cleanup para liberar RAM/disco de instâncias que não
+  // existem mais no banco do hub.
+  async removeSession(id) {
+    const session = this.sessions.get(id);
+    if (session && session.socket) {
+      try { await session.socket.logout(); } catch {}
+      try { session.socket.end?.(); } catch {}
+      session.socket = null;
+    }
+    this._clearReconnectTimer(id);
+    this.sessions.delete(id);
+    this.reconnectAttempts.delete(id);
+
+    const dir = path.join(SESSIONS_DIR, id);
+    if (fs.existsSync(dir)) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch (err) {
+        console.log(`   ⚠️ Falha ao remover ${dir}: ${err.message}`);
+      }
+    }
+    return { id, removed: true };
+  }
+
+  // Recebe a lista de IDs que devem permanecer. Tudo o que não estiver nela
+  // (tanto na memória quanto no disco) é removido. Retorna o que foi limpo.
+  async cleanupOrphans(keepIds) {
+    const keep = new Set((keepIds || []).map(String));
+    const removed = [];
+
+    // 1) Pastas no disco que não estão na lista
+    if (fs.existsSync(SESSIONS_DIR)) {
+      const dirs = fs.readdirSync(SESSIONS_DIR).filter((d) =>
+        fs.statSync(path.join(SESSIONS_DIR, d)).isDirectory()
+      );
+      for (const id of dirs) {
+        if (!keep.has(id)) {
+          await this.removeSession(id);
+          removed.push(id);
+        }
+      }
+    }
+
+    // 2) Sessões só-em-memória (sem pasta) que não estão na lista
+    for (const id of Array.from(this.sessions.keys())) {
+      if (!keep.has(id) && !removed.includes(id)) {
+        await this.removeSession(id);
+        removed.push(id);
+      }
+    }
+
+    return { kept: keep.size, removed: removed.length, removedIds: removed };
+  }
+
   status(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -852,7 +906,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.6" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.7" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -880,6 +934,24 @@ app.post("/instance/create", requireAdmin, async (req, res) => {
 
 app.get("/instance/list", requireAdmin, (_, res) => {
   res.json({ success: true, instances: sessions.listAll() });
+});
+
+// POST /sessions/cleanup (admin) — recebe { keep: [id, ...] } e remove
+// da memória + disco toda sessão que não estiver na lista. Devolve a
+// quantidade removida e os IDs afetados. Útil para liberar RAM de
+// instâncias órfãs (deletadas no hub mas que ficaram no /app/sessions).
+app.post("/sessions/cleanup", requireAdmin, async (req, res) => {
+  try {
+    const { keep } = req.body || {};
+    if (!Array.isArray(keep)) {
+      return res.status(400).json({ success: false, error: "keep[] required" });
+    }
+    const result = await sessions.cleanupOrphans(keep);
+    console.log(`🧹 Cleanup: mantidas ${result.kept}, removidas ${result.removed}`);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post("/connect", requireInstance, async (req, res) => {
@@ -1006,11 +1078,7 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 WhatsHub Engine v2.5 online na porta ${PORT}`);
+  console.log(`🚀 WhatsHub Engine v2.7 online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
-
-
-
-
