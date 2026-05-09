@@ -1,7 +1,12 @@
 
 // ============================================================================
-// WhatsHub Engine v2.6 - Motor Baileys + Sincronização Completa de Contatos
+// WhatsHub Engine v2.9 - Motor Baileys + Cache & Circuit-Breaker em /chats
 // ----------------------------------------------------------------------------
+// v2.9 — Proteção anti rate-overlimit do groupFetchAllParticipating:
+//   - Cache em memória de 60s por instância (resultado de /chats)
+//   - Single-flight: chamadas concorrentes compartilham a mesma Promise
+//   - Circuit-breaker: 120s de cooldown servindo cache após rate-overlimit
+//   - Reduz pressão no servidor do WhatsApp e protege o número de bloqueios
 // v2.6 — Sincronização completa de contatos (nomes da agenda do celular):
 //   - syncFullHistory: true para Baileys puxar a lista completa de contatos
 //   - Resolve o caso "chat aparece só com número" mesmo com contato salvo
@@ -227,6 +232,15 @@ class SessionManager {
       chats: new Map(),          // jid -> { id, name, isGroup, lastMessageTs, lastMessageText, lastMessageFromMe, unreadCount, picture }
       contacts: new Map(),       // jid -> { id, name, pushName, notify }
       messagesByJid: new Map(),  // jid -> Array<{ key, message, messageTimestamp, pushName }> (máx 200/jid)
+      // ─── Proteção anti rate-overlimit do groupFetchAllParticipating (v2.9) ───
+      // groupsCache: último resultado bem-sucedido (mantido até nova chamada bem-sucedida).
+      // groupsCacheAt: timestamp do cache.
+      // groupsCooldownUntil: quando o WhatsApp respondeu rate-overlimit, bloqueia novas chamadas até esse ms.
+      // groupsInflight: Promise em curso para deduplicar chamadas concorrentes (single-flight).
+      groupsCache: null,
+      groupsCacheAt: 0,
+      groupsCooldownUntil: 0,
+      groupsInflight: null,
       lastDisconnectReason: null,
       qrRetries: 0,
       createdAt: new Date().toISOString(),
@@ -891,11 +905,54 @@ class SessionManager {
     if (session.phone) meCandidates.add(numOnly(session.phone));
 
     // ─── Grupos (fonte autoritativa: groupFetchAllParticipating) ───
+    // ───────────────────────────────────────────────────────────────────────
+    // PROTEÇÃO v2.9: cache 60s + circuit-breaker em rate-overlimit + single-flight.
+    // Motivo: groupFetchAllParticipating é uma chamada PESADA do servidor do WhatsApp.
+    // Sem proteção, apps externos chamando /chats em loop derrubam o número em "rate-overlimit"
+    // e, em volume sustentado, podem causar bloqueio temporário/permanente daquele WhatsApp.
+    // Estratégia: o motor só bate no WhatsApp 1x a cada 60s POR INSTÂNCIA, mesmo com N
+    // requisições concorrentes vindas dos consumidores.
+    // ───────────────────────────────────────────────────────────────────────
+    const GROUPS_CACHE_TTL_MS = 60 * 1000;        // 1 min de cache fresco
+    const GROUPS_COOLDOWN_MS = 120 * 1000;        // 2 min de bloqueio após rate-overlimit
+    const now = Date.now();
+
     let groupsMap = {};
-    try {
-      groupsMap = await sock.groupFetchAllParticipating();
-    } catch (err) {
-      console.log(`⚠️ [${id}] groupFetchAllParticipating falhou: ${err.message}`);
+    const cacheStillFresh = session.groupsCache && (now - session.groupsCacheAt) < GROUPS_CACHE_TTL_MS;
+    const inCooldown = now < session.groupsCooldownUntil;
+
+    if (cacheStillFresh) {
+      // Cache fresco — devolve sem bater no WhatsApp.
+      groupsMap = session.groupsCache;
+    } else if (inCooldown) {
+      // Estamos em cooldown pós rate-overlimit. Devolve cache antigo (mesmo expirado) ou vazio.
+      // Importante: NÃO logar a cada chamada — só no início do cooldown (já foi logado).
+      groupsMap = session.groupsCache || {};
+    } else {
+      // Single-flight: se já tem uma chamada em curso, aguarda ela em vez de disparar outra.
+      if (!session.groupsInflight) {
+        session.groupsInflight = (async () => {
+          try {
+            const fresh = await sock.groupFetchAllParticipating();
+            session.groupsCache = fresh;
+            session.groupsCacheAt = Date.now();
+            return fresh;
+          } catch (err) {
+            const msg = err?.message || String(err);
+            const isRateLimit = /rate-overlimit|rate.?limit/i.test(msg);
+            if (isRateLimit) {
+              session.groupsCooldownUntil = Date.now() + GROUPS_COOLDOWN_MS;
+              console.log(`⚠️ [${id}] groupFetchAllParticipating: rate-overlimit do WhatsApp — cooldown de ${GROUPS_COOLDOWN_MS / 1000}s ativado. Servindo cache.`);
+            } else {
+              console.log(`⚠️ [${id}] groupFetchAllParticipating falhou: ${msg}`);
+            }
+            return session.groupsCache || {};
+          } finally {
+            session.groupsInflight = null;
+          }
+        })();
+      }
+      groupsMap = await session.groupsInflight;
     }
 
     const groupChats = Object.values(groupsMap).map((g) => {
@@ -1036,7 +1093,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.8" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.9" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
