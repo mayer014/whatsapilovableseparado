@@ -1,10 +1,15 @@
 // ============================================================================
-// WhatsHub Engine v2.4 - Motor Baileys com Persistência + Mídia + Validação BR
+// WhatsHub Engine v2.5 - Motor Baileys com Persistência + Mídia + Chats Completos
 // ----------------------------------------------------------------------------
-// v3 — Contrato completo de mídia no webhook:
+// v2.5 — Suporte completo a chats 1:1 + grupos + histórico por JID:
+//   - GET /chats devolve 1:1 e grupos com name, lastMessage, unreadCount, picture
+//   - GET /messages/:jid?limit=50 devolve histórico em memória (formato Baileys)
+//   - GET /contacts lista contatos conhecidos (pushName, notify)
+//   - Store em memória alimentada por events de chats/contacts/messages
+// v3 — Contrato completo de mídia no webhook (mantido):
 //   - pushName, fromMe, isPtt
 //   - mediaMimeType, mediaFileName, mediaSizeBytes, mediaDurationSeconds
-//   - GET /media/:messageId enriquecido (Content-Disposition com filename real)
+//   - GET /media/:messageId com Content-Disposition (filename real)
 // ============================================================================
 
 const express = require("express");
@@ -108,6 +113,10 @@ class SessionManager {
       phone: null,
       webhook: null,
       messageIndex: new Map(),
+      // ─── Stores em memória para rotas /chats, /messages/:jid e /contacts ───
+      chats: new Map(),          // jid -> { id, name, isGroup, lastMessageTs, lastMessageText, lastMessageFromMe, unreadCount, picture }
+      contacts: new Map(),       // jid -> { id, name, pushName, notify }
+      messagesByJid: new Map(),  // jid -> Array<{ key, message, messageTimestamp, pushName }> (máx 200/jid)
       lastDisconnectReason: null,
       qrRetries: 0,
       createdAt: new Date().toISOString(),
@@ -162,6 +171,11 @@ class SessionManager {
           createdAt: meta.createdAt,
         };
         this.sessions.set(id, session);
+        // Inicializa stores em memória (não persistidos — rebuild via events ao reconectar)
+        session.chats = new Map();
+        session.contacts = new Map();
+        session.messagesByJid = new Map();
+        session.messageIndex = new Map();
 
         if (fs.existsSync(credsPath)) {
           console.log(`   → Reconectando ${id}...`);
@@ -218,7 +232,9 @@ class SessionManager {
       markOnlineOnConnect: true,
       printQRInTerminal: false,
       keepAliveIntervalMs: 30000,
-      shouldSyncHistoryMessage: () => false,
+      // Sincroniza histórico recente (chats e mensagens) ao conectar para
+      // popular as stores de chats/messages/contacts. Não puxa histórico completo.
+      shouldSyncHistoryMessage: () => true,
       syncFullHistory: false,
     });
 
@@ -226,6 +242,114 @@ class SessionManager {
     session.status = "connecting";
 
     socket.ev.on("creds.update", saveCreds);
+
+    // ─── Helpers de upsert nas stores ───
+    const upsertChat = (jid, patch = {}) => {
+      if (!jid || jid === "status@broadcast") return;
+      const prev = session.chats.get(jid) || {
+        id: jid,
+        name: null,
+        isGroup: jid.endsWith("@g.us"),
+        lastMessageTs: 0,
+        lastMessageText: null,
+        lastMessageFromMe: false,
+        unreadCount: 0,
+        picture: null,
+      };
+      session.chats.set(jid, { ...prev, ...patch });
+    };
+
+    const upsertContact = (c) => {
+      if (!c || !c.id) return;
+      const prev = session.contacts.get(c.id) || { id: c.id };
+      session.contacts.set(c.id, {
+        ...prev,
+        id: c.id,
+        name: c.name || c.verifiedName || prev.name || null,
+        pushName: c.notify || c.pushName || prev.pushName || null,
+        notify: c.notify || prev.notify || null,
+      });
+      // Reflete nome do contato 1:1 no chat (se já existir)
+      if (!c.id.endsWith("@g.us") && session.chats.has(c.id)) {
+        const chat = session.chats.get(c.id);
+        if (!chat.name) {
+          chat.name = c.name || c.verifiedName || c.notify || chat.name;
+          session.chats.set(c.id, chat);
+        }
+      }
+    };
+
+    const pushMessageToJid = (jid, msg) => {
+      if (!jid) return;
+      const arr = session.messagesByJid.get(jid) || [];
+      // Evita duplicatas pelo messageId
+      const id = msg.key?.id;
+      if (id && arr.some((m) => m.key?.id === id)) return;
+      arr.push(msg);
+      // Mantém ordenado por timestamp e limita a 200
+      arr.sort((a, b) => Number(a.messageTimestamp || 0) - Number(b.messageTimestamp || 0));
+      if (arr.length > 200) arr.splice(0, arr.length - 200);
+      session.messagesByJid.set(jid, arr);
+    };
+
+    // ─── Sync inicial de chats/contatos vindos do histórico ───
+    socket.ev.on("messaging-history.set", ({ chats = [], contacts = [], messages = [] }) => {
+      console.log(`📚 [${id}] history.set: ${chats.length} chats, ${contacts.length} contatos, ${messages.length} msgs`);
+      for (const c of chats) {
+        upsertChat(c.id, {
+          name: c.name || c.subject || null,
+          isGroup: c.id?.endsWith("@g.us") || false,
+          unreadCount: c.unreadCount || 0,
+          lastMessageTs: Number(c.conversationTimestamp || 0),
+        });
+      }
+      for (const c of contacts) upsertContact(c);
+      for (const m of messages) {
+        if (!m.key?.remoteJid || !m.message) continue;
+        pushMessageToJid(m.key.remoteJid, m);
+      }
+    });
+
+    socket.ev.on("chats.set", ({ chats = [] }) => {
+      for (const c of chats) {
+        upsertChat(c.id, {
+          name: c.name || c.subject || null,
+          isGroup: c.id?.endsWith("@g.us") || false,
+          unreadCount: c.unreadCount || 0,
+          lastMessageTs: Number(c.conversationTimestamp || 0),
+        });
+      }
+    });
+    socket.ev.on("chats.upsert", (chats) => {
+      for (const c of chats) {
+        upsertChat(c.id, {
+          name: c.name || c.subject || null,
+          isGroup: c.id?.endsWith("@g.us") || false,
+          unreadCount: c.unreadCount || 0,
+          lastMessageTs: Number(c.conversationTimestamp || 0),
+        });
+      }
+    });
+    socket.ev.on("chats.update", (updates) => {
+      for (const u of updates) {
+        if (!u.id) continue;
+        const patch = {};
+        if (u.name || u.subject) patch.name = u.name || u.subject;
+        if (u.unreadCount !== undefined) patch.unreadCount = u.unreadCount;
+        if (u.conversationTimestamp) patch.lastMessageTs = Number(u.conversationTimestamp);
+        upsertChat(u.id, patch);
+      }
+    });
+
+    socket.ev.on("contacts.set", ({ contacts = [] }) => {
+      for (const c of contacts) upsertContact(c);
+    });
+    socket.ev.on("contacts.upsert", (contacts) => {
+      for (const c of contacts) upsertContact(c);
+    });
+    socket.ev.on("contacts.update", (updates) => {
+      for (const c of updates) upsertContact(c);
+    });
 
     // ------- Mensagens recebidas/enviadas + Webhook (contrato v2.1 COMPLETO) -------
     socket.ev.on("messages.upsert", async ({ messages }) => {
@@ -266,6 +390,34 @@ class SessionManager {
           const firstKey = session.messageIndex.keys().next().value;
           session.messageIndex.delete(firstKey);
         }
+
+        // ─── Atualiza stores de chat e mensagens por JID ───
+        const ts = Number(msg.messageTimestamp || Math.floor(Date.now() / 1000));
+        upsertChat(jid, {
+          isGroup: jid.endsWith("@g.us"),
+          lastMessageTs: ts,
+          lastMessageText: text || `[${messageType}]`,
+          lastMessageFromMe: !!msg.key.fromMe,
+          // Incrementa unread só para mensagens recebidas
+          unreadCount: msg.key.fromMe
+            ? (session.chats.get(jid)?.unreadCount || 0)
+            : (session.chats.get(jid)?.unreadCount || 0) + 1,
+        });
+        // Para 1:1 sem nome, usa pushName como fallback
+        if (!jid.endsWith("@g.us") && msg.pushName) {
+          const chat = session.chats.get(jid);
+          if (chat && !chat.name) {
+            chat.name = msg.pushName;
+            session.chats.set(jid, chat);
+          }
+          upsertContact({ id: jid, notify: msg.pushName });
+        }
+        pushMessageToJid(jid, {
+          key: msg.key,
+          message: msg.message,
+          messageTimestamp: ts,
+          pushName: msg.pushName || null,
+        });
 
         console.log(
           `📩 [${id}] ${msg.key.fromMe ? "→" : "←"} ${jid} (${messageType}${meta.isPtt ? "/ptt" : ""}): ${text.slice(0, 50)}`
@@ -526,7 +678,8 @@ class SessionManager {
   }
 
   // Lista grupos da sessão (Baileys groupFetchAllParticipating).
-  // Retorna formato consumido pela bridge: id (@g.us), subject, participants_count, isGroup, isAdmin, announce.
+  // Combina grupos (groupFetchAllParticipating) + 1:1 (store em memória).
+  // Retorna payload normalizado: id, name, isGroup, lastMessage, unreadCount, picture, participants_count, isAdmin.
   // IMPORTANTE: o JID da sessão (sock.user.id) vem com sufixo de device (ex.: "5567xxx:42@s.whatsapp.net")
   // e/ou em formato LID (xxx@lid). Os participants[] do grupo podem usar PN ou LID. Por isso normalizamos
   // para apenas a parte numérica antes de comparar — caso contrário isAdmin sempre cai em false.
@@ -550,31 +703,99 @@ class SessionManager {
     // Alguns builds expõem só o phone
     if (session.phone) meCandidates.add(numOnly(session.phone));
 
-    const groupsMap = await sock.groupFetchAllParticipating();
-    return Object.values(groupsMap).map((g) => {
+    // ─── Grupos (fonte autoritativa: groupFetchAllParticipating) ───
+    let groupsMap = {};
+    try {
+      groupsMap = await sock.groupFetchAllParticipating();
+    } catch (err) {
+      console.log(`⚠️ [${id}] groupFetchAllParticipating falhou: ${err.message}`);
+    }
+
+    const groupChats = Object.values(groupsMap).map((g) => {
       const participants = g.participants || [];
-      // Procura o próprio número entre os participantes comparando por dígitos
       const meEntry = participants.find((p) => {
         const candidates = [p.id, p.jid, p.lid, p.phoneNumber].filter(Boolean).map(numOnly);
         return candidates.some((c) => c && meCandidates.has(c));
       });
-      const adminFlag = meEntry?.admin; // "admin" | "superadmin" | null
+      const adminFlag = meEntry?.admin;
       const isAdmin = !!(meEntry && (adminFlag === "admin" || adminFlag === "superadmin" || meEntry.isAdmin === true || meEntry.isSuperAdmin === true));
       const announce = !!(g.announce ?? g.announcement ?? g.restrict);
+      // Mescla com a store em memória (lastMessage, unreadCount)
+      const stored = session.chats.get(g.id) || {};
+      // Garante que o nome do grupo fique salvo na store
+      if (g.subject) {
+        session.chats.set(g.id, {
+          ...stored,
+          id: g.id,
+          name: g.subject,
+          isGroup: true,
+        });
+      }
       return {
         id: g.id,
+        name: g.subject || stored.name || null,
+        // Mantido por compat: alguns clientes ainda leem "subject"
         subject: g.subject || null,
+        isGroup: true,
         picture: null,
         participants_count: participants.length,
-        isGroup: true,
         isAdmin,
-        // Aliases para máxima compatibilidade com a bridge
         is_admin: isAdmin,
         iAmAdmin: isAdmin,
         announce,
         is_announcement: announce,
+        unreadCount: stored.unreadCount || 0,
+        lastMessage: stored.lastMessageTs ? {
+          text: stored.lastMessageText,
+          timestamp: stored.lastMessageTs,
+          fromMe: stored.lastMessageFromMe,
+        } : null,
       };
     });
+
+    // ─── 1:1 (vem da store em memória, alimentada por messages.upsert + history.set) ───
+    const directChats = [];
+    for (const [jid, chat] of session.chats.entries()) {
+      if (jid.endsWith("@g.us") || jid.endsWith("@broadcast") || jid.endsWith("@lid")) continue;
+      // Só conta como 1:1 quem tem domínio @s.whatsapp.net
+      if (!jid.endsWith("@s.whatsapp.net")) continue;
+      const contact = session.contacts.get(jid);
+      directChats.push({
+        id: jid,
+        name: chat.name || contact?.name || contact?.pushName || contact?.notify || null,
+        isGroup: false,
+        picture: null,
+        unreadCount: chat.unreadCount || 0,
+        lastMessage: chat.lastMessageTs ? {
+          text: chat.lastMessageText,
+          timestamp: chat.lastMessageTs,
+          fromMe: chat.lastMessageFromMe,
+        } : null,
+      });
+    }
+
+    // Ordena por timestamp da última mensagem (desc); chats sem msg vão pro fim
+    const all = [...groupChats, ...directChats];
+    all.sort((a, b) => (b.lastMessage?.timestamp || 0) - (a.lastMessage?.timestamp || 0));
+    return all;
+  }
+
+  // Lista mensagens de um JID específico (formato Baileys), lidas da store em memória.
+  // Não chama a rede — devolve o histórico já capturado por messages.upsert + history.set.
+  listMessages(id, jid, limit = 50) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    const arr = session.messagesByJid.get(jid) || [];
+    const lim = Math.max(1, Math.min(Number(limit) || 50, 200));
+    // Devolve as últimas N, em ordem cronológica ascendente
+    return arr.slice(-lim);
+  }
+
+  // Lista contatos conhecidos da sessão.
+  listContacts(id) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    return Array.from(session.contacts.values());
   }
 
   listAll() {
@@ -628,7 +849,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.4" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.5" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -681,11 +902,37 @@ app.get("/status", requireInstance, (req, res) => {
 });
 
 // GET /chats — lista grupos/conversas da instância (autenticado por x-instance-token)
-// Resposta: array de objetos compatível com a bridge (groups primeiro). 1:1 ainda não suportado.
+// Resposta: array com grupos + conversas 1:1. Cada item tem { id, name, isGroup,
+// lastMessage, unreadCount, picture }. Ordenado por última mensagem desc.
 app.get("/chats", requireInstance, async (req, res) => {
   try {
     const chats = await sessions.listChats(req.session.id);
     res.json(chats);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /messages/:jid?limit=50 — histórico de mensagens de um JID (formato Baileys).
+// Lê da store em memória (alimentada por messages.upsert + history.set).
+// Útil para o cliente abrir um chat e exibir o histórico recente sem polling.
+app.get("/messages/:jid", requireInstance, (req, res) => {
+  try {
+    const jid = decodeURIComponent(req.params.jid);
+    const limit = req.query.limit ? Number(req.query.limit) : 50;
+    const messages = sessions.listMessages(req.session.id, jid, limit);
+    res.json({ jid, count: messages.length, messages });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /contacts — lista contatos conhecidos (pushName/notify) da sessão.
+// Útil para resolver nome de 1:1 que ainda não trocou mensagem.
+app.get("/contacts", requireInstance, (req, res) => {
+  try {
+    const contacts = sessions.listContacts(req.session.id);
+    res.json({ count: contacts.length, contacts });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -756,9 +1003,10 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 WhatsHub Engine v2.4 online na porta ${PORT}`);
+  console.log(`🚀 WhatsHub Engine v2.5 online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
+
 
 
