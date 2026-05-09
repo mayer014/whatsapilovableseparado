@@ -1,3 +1,4 @@
+
 // ============================================================================
 // WhatsHub Engine v2.6 - Motor Baileys + Sincronização Completa de Contatos
 // ----------------------------------------------------------------------------
@@ -45,6 +46,73 @@ if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 }
 
+// ─── Persistência do índice de mensagens (v2.8) ────────────────────────────
+// Cada sessão grava as mensagens recebidas em /app/sessions/<id>/messages.jsonl
+// (uma JSON por linha). Permite que /media/:messageId continue funcionando
+// após restart do container e que /messages/:jid devolva histórico real.
+// Mantém no máx. MESSAGE_PERSIST_LIMIT linhas por arquivo (rotação simples).
+const MESSAGE_PERSIST_LIMIT = 5000;
+
+function messagesFilePath(sessionId) {
+  return path.join(SESSIONS_DIR, sessionId, "messages.jsonl");
+}
+
+// Grava (append) uma mensagem no arquivo da sessão. Salvamos só o essencial
+// (key + message + messageTimestamp + pushName) para conseguir baixar mídia
+// depois com downloadMediaMessage.
+function persistMessageLine(session, msg) {
+  try {
+    const file = messagesFilePath(session.id);
+    const line = JSON.stringify({
+      key: msg.key,
+      message: msg.message,
+      messageTimestamp: msg.messageTimestamp,
+      pushName: msg.pushName || null,
+    }) + "\n";
+    fs.appendFileSync(file, line);
+
+    // Rotação preguiçosa: a cada 500 mensagens persistidas verifica tamanho.
+    session._persistCount = (session._persistCount || 0) + 1;
+    if (session._persistCount % 500 === 0) {
+      rotateMessagesFile(session.id);
+    }
+  } catch (err) {
+    console.log(`⚠️ [${session.id}] Falha persist msg: ${err.message}`);
+  }
+}
+
+function rotateMessagesFile(sessionId) {
+  try {
+    const file = messagesFilePath(sessionId);
+    if (!fs.existsSync(file)) return;
+    const lines = fs.readFileSync(file, "utf-8").split("\n").filter(Boolean);
+    if (lines.length <= MESSAGE_PERSIST_LIMIT) return;
+    const trimmed = lines.slice(-MESSAGE_PERSIST_LIMIT).join("\n") + "\n";
+    fs.writeFileSync(file, trimmed);
+    console.log(`♻️  [${sessionId}] messages.jsonl rotacionado para ${MESSAGE_PERSIST_LIMIT} linhas`);
+  } catch (err) {
+    console.log(`⚠️ [${sessionId}] Falha rotação: ${err.message}`);
+  }
+}
+
+// Lê o arquivo da sessão e devolve as últimas N mensagens parseadas.
+function readPersistedMessages(sessionId, limit = MESSAGE_PERSIST_LIMIT) {
+  const file = messagesFilePath(sessionId);
+  if (!fs.existsSync(file)) return [];
+  try {
+    const lines = fs.readFileSync(file, "utf-8").split("\n").filter(Boolean);
+    const slice = lines.slice(-limit);
+    const out = [];
+    for (const l of slice) {
+      try { out.push(JSON.parse(l)); } catch { /* ignora linha corrompida */ }
+    }
+    return out;
+  } catch (err) {
+    console.log(`⚠️ [${sessionId}] Falha ler messages.jsonl: ${err.message}`);
+    return [];
+  }
+}
+
 // ---------- Helpers de extração de metadata de mídia (contrato v2.1) ----------
 function detectMessageType(m) {
   if (m.imageMessage) return "image";
@@ -84,6 +152,45 @@ function extractMediaMeta(m, messageType) {
     mediaSizeBytes: node.fileLength ? Number(node.fileLength) : null,
     mediaDurationSeconds: node.seconds || null,
     isPtt: !!(m.audioMessage && m.audioMessage.ptt),
+  };
+}
+
+// Monta o objeto enriquecido devolvido pela API REST (/messages/:jid).
+// Inclui mediaUrl absoluto + metadata, no mesmo formato do webhook,
+// para que o app externo não precise montar URL nem detectar tipo.
+function enrichMessageForApi(session, msg) {
+  const m = msg.message || {};
+  const messageType = detectMessageType(m);
+  const isMedia = messageType !== "text" && messageType !== "location" && messageType !== "contact";
+  const messageId = msg.key?.id;
+  const mediaUrl = isMedia && messageId
+    ? (PUBLIC_URL
+        ? `${PUBLIC_URL}/media/${messageId}?t=${encodeURIComponent(session.token)}`
+        : `/media/${messageId}`)
+    : null;
+  const meta = extractMediaMeta(m, messageType);
+  const text =
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.documentMessage?.caption ||
+    m.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+    "";
+  return {
+    key: msg.key,
+    message: msg.message,
+    messageTimestamp: msg.messageTimestamp,
+    pushName: msg.pushName || null,
+    // Campos enriquecidos (espelham o webhook):
+    messageType,
+    text,
+    mediaUrl,
+    mediaMimeType: meta.mediaMimeType,
+    mediaFileName: meta.mediaFileName,
+    mediaSizeBytes: meta.mediaSizeBytes,
+    mediaDurationSeconds: meta.mediaDurationSeconds,
+    isPtt: meta.isPtt,
   };
 }
 
@@ -179,6 +286,25 @@ class SessionManager {
         session.contacts = new Map();
         session.messagesByJid = new Map();
         session.messageIndex = new Map();
+
+        // v2.8: replay do messages.jsonl para popular messageIndex e
+        // messagesByJid antes mesmo do socket reconectar. Garante que
+        // /media/:messageId e /messages/:jid funcionem após restart.
+        const persisted = readPersistedMessages(id);
+        for (const m of persisted) {
+          if (!m.key?.id || !m.message) continue;
+          session.messageIndex.set(m.key.id, { key: m.key, message: m.message });
+          const jid = m.key.remoteJid;
+          if (jid) {
+            const arr = session.messagesByJid.get(jid) || [];
+            arr.push(m);
+            if (arr.length > 200) arr.splice(0, arr.length - 200);
+            session.messagesByJid.set(jid, arr);
+          }
+        }
+        if (persisted.length) {
+          console.log(`   📦 ${id}: ${persisted.length} msg(s) restauradas do disco`);
+        }
 
         if (fs.existsSync(credsPath)) {
           console.log(`   → Reconectando ${id}...`);
@@ -389,10 +515,14 @@ class SessionManager {
           message: msg.message,
         });
 
-        if (session.messageIndex.size > 1000) {
+        if (session.messageIndex.size > MESSAGE_PERSIST_LIMIT) {
           const firstKey = session.messageIndex.keys().next().value;
           session.messageIndex.delete(firstKey);
         }
+
+        // v2.8: persiste em disco para sobreviver a restart e permitir
+        // que /media/:messageId baixe mídia antiga.
+        persistMessageLine(session, msg);
 
         // ─── Atualiza stores de chat e mensagens por JID ───
         const ts = Number(msg.messageTimestamp || Math.floor(Date.now() / 1000));
@@ -906,7 +1036,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.7" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.8" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -996,7 +1126,10 @@ app.get("/messages/:jid", requireInstance, (req, res) => {
     const jid = decodeURIComponent(req.params.jid);
     const limit = req.query.limit ? Number(req.query.limit) : 50;
     const messages = sessions.listMessages(req.session.id, jid, limit);
-    res.json({ jid, count: messages.length, messages });
+    // v2.8: enriquece cada mensagem com mediaUrl absoluto + metadata
+    // para o app externo poder baixar imagem/áudio direto via <img>/<audio>.
+    const enriched = messages.map((m) => enrichMessageForApi(req.session, m));
+    res.json({ jid, count: enriched.length, messages: enriched });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -1078,7 +1211,7 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 WhatsHub Engine v2.7 online na porta ${PORT}`);
+  console.log(`🚀 WhatsHub Engine v2.8 online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
