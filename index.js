@@ -1,7 +1,15 @@
 
 // ============================================================================
-// WhatsHub Engine v2.9 - Motor Baileys + Cache & Circuit-Breaker em /chats
+// WhatsHub Engine v2.10 - Motor Baileys + Resolução canônica de JID (onWhatsApp)
 // ----------------------------------------------------------------------------
+// v2.10 — Resolução canônica de JID antes do envio 1:1:
+//   • Antes do send, chama sock.onWhatsApp([numero, variante BR]) para descobrir o JID real.
+//   • Se nenhum candidato existir → erro 404 ("Número não encontrado no WhatsApp")
+//     em vez de fingir delivered:true para um JID inexistente.
+//   • Resposta passa a incluir ''resolvedFrom'' indicando qual variante foi aceita.
+//   • Corrige bug v2.9 onde mensagens para variantes erradas (com/sem o "9")
+//     desapareciam silenciosamente porque sendMessage sempre devolvia key.id.
+//
 // v2.9 — Proteção anti rate-overlimit do groupFetchAllParticipating:
 //   - Cache em memória de 60s por instância (resultado de /chats)
 //   - Single-flight: chamadas concorrentes compartilham a mesma Promise
@@ -784,13 +792,16 @@ class SessionManager {
       }
     }
 
-    // ----- Envio 1:1 -----
-    let targetJid;
+    // ----- Envio 1:1 (v2.10: canonicaliza JID via onWhatsApp antes de enviar) -----
+    // PROBLEMA v2.9: sendMessage sempre retorna key.id, mesmo para JIDs inexistentes.
+    // Mensagens para variantes erradas (ex: com/sem o "9") sumiam silenciosamente.
+    // FIX v2.10: usa sock.onWhatsApp([candidatos]) para descobrir o JID real cadastrado
+    // no WhatsApp ANTES de chamar sendMessage. Se nenhum candidato existir → erro 404.
     let phone;
+    let inputJid = null;
 
     if (isUserJid) {
-      // JID já formatado: extrai dígitos para tentativa BR alternativa
-      targetJid = raw;
+      inputJid = raw;
       phone = raw.split("@")[0].split(":")[0].replace(/\D/g, "");
     } else {
       phone = raw.replace(/\D/g, "");
@@ -799,42 +810,65 @@ class SessionManager {
           `Número inválido: "${recipientRaw}". Use formato 55 + DDD + número (ex: 5567999999999) ou JID @g.us para grupos`
         );
       }
-      targetJid = `${phone}@s.whatsapp.net`;
+    }
+
+    // Monta lista de candidatos (número original + variante BR com/sem "9")
+    const candidates = [];
+    if (phone) candidates.push(phone);
+    const alt = tryBrazilianAlternative(phone);
+    if (alt && !candidates.includes(alt)) candidates.push(alt);
+
+    // Resolve via onWhatsApp para obter JID canônico
+    let canonicalJid = null;
+    let resolvedFrom = null;
+    try {
+      const checks = await session.socket.onWhatsApp(...candidates);
+      // Baileys retorna [{ jid, exists }, ...]
+      for (const c of (checks || [])) {
+        if (c && c.exists && c.jid) {
+          canonicalJid = c.jid;
+          resolvedFrom = c.jid.split("@")[0];
+          break;
+        }
+      }
+    } catch (err) {
+      console.log(`⚠️ [${id}] onWhatsApp falhou: ${err.message}`);
+    }
+
+    // Fallback: se onWhatsApp falhou (rede/timeout) mas temos JID já formatado pelo cliente, tenta esse
+    if (!canonicalJid && inputJid) {
+      console.log(`⚠️ [${id}] onWhatsApp não respondeu — usando JID fornecido pelo cliente como fallback`);
+      canonicalJid = inputJid;
+    }
+
+    if (!canonicalJid) {
+      throw new Error(
+        `Número não encontrado no WhatsApp: ${candidates.join(" / ")}. Verifique se o destinatário possui WhatsApp ativo.`
+      );
     }
 
     let sent = null;
     let delivered = false;
-
     try {
-      sent = await session.socket.sendMessage(targetJid, { text: String(message) });
+      sent = await session.socket.sendMessage(canonicalJid, { text: String(message) });
       delivered = !!sent?.key?.id;
     } catch (err) {
-      console.log(`⚠️ [${id}] Envio inicial falhou: ${err.message}`);
-    }
-
-    if (!delivered && phone) {
-      const alt = tryBrazilianAlternative(phone);
-      if (alt) {
-        try {
-          const altJid = `${alt}@s.whatsapp.net`;
-          console.log(`🔁 [${id}] Tentando alternativa BR: ${alt}`);
-          sent = await session.socket.sendMessage(altJid, { text: String(message) });
-          delivered = !!sent?.key?.id;
-        } catch (err) {
-          console.log(`⚠️ [${id}] Alternativa falhou: ${err.message}`);
-        }
-      }
+      console.log(`⚠️ [${id}] sendMessage falhou para ${canonicalJid}: ${err.message}`);
+      throw new Error(`Falha ao enviar para ${canonicalJid}: ${err.message}`);
     }
 
     if (!delivered) {
       throw new Error("Envio não confirmado pela rede WhatsApp (sem messageId)");
     }
 
+    console.log(`📤 [${id}] → ${canonicalJid} (resolvido de ${resolvedFrom || phone}): ${String(message).slice(0, 50)}`);
+
     return {
       success: true,
       delivered: true,
       messageId: sent?.key?.id || null,
-      to: targetJid,
+      to: canonicalJid,
+      resolvedFrom: resolvedFrom || phone,
     };
   }
 
@@ -1093,7 +1127,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.9" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.10" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -1268,7 +1302,7 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 WhatsHub Engine v2.8 online na porta ${PORT}`);
+  console.log(`🚀 WhatsHub Engine v2.10 online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
