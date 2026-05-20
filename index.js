@@ -872,6 +872,105 @@ class SessionManager {
     };
   }
 
+  // ─── Envio de mídia (v2.11) ────────────────────────────────────────────────
+  // Baixa a URL pública informada e envia via Baileys como image/video/audio/document.
+  // Reusa a mesma resolução de JID do send() (grupo direto, 1:1 via onWhatsApp).
+  async sendMedia(id, recipientRaw, mediaUrl, caption, mediaType, fileName) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    if (session.status !== "connected" || !session.socket) {
+      throw new Error("Instance not connected");
+    }
+
+    const raw = String(recipientRaw || "").trim();
+    if (!raw) throw new Error("Destinatário vazio");
+    if (!mediaUrl) throw new Error("mediaUrl é obrigatório");
+
+    const type = String(mediaType || "image").toLowerCase();
+    if (!["image", "video", "audio", "document"].includes(type)) {
+      throw new Error(`mediaType inválido: ${type}. Use image|video|audio|document`);
+    }
+
+    // ----- Resolve o JID destinatário (mesma lógica do send) -----
+    const isGroupJid = raw.endsWith("@g.us");
+    const isUserJid = raw.endsWith("@s.whatsapp.net");
+    let canonicalJid = null;
+    let resolvedFrom = null;
+
+    if (isGroupJid) {
+      canonicalJid = raw;
+    } else {
+      let phone, inputJid = null;
+      if (isUserJid) {
+        inputJid = raw;
+        phone = raw.split("@")[0].split(":")[0].replace(/\D/g, "");
+      } else {
+        phone = raw.replace(/\D/g, "");
+        if (!phone.startsWith("55") || phone.length < 12 || phone.length > 13) {
+          throw new Error(`Número inválido: "${recipientRaw}". Use formato 55 + DDD + número`);
+        }
+      }
+      const candidates = [phone];
+      const alt = tryBrazilianAlternative(phone);
+      if (alt && !candidates.includes(alt)) candidates.push(alt);
+      try {
+        const checks = await session.socket.onWhatsApp(...candidates);
+        for (const c of (checks || [])) {
+          if (c && c.exists && c.jid) {
+            canonicalJid = c.jid;
+            resolvedFrom = c.jid.split("@")[0];
+            break;
+          }
+        }
+      } catch (err) {
+        console.log(`⚠️ [${id}] onWhatsApp falhou (media): ${err.message}`);
+      }
+      if (!canonicalJid && inputJid) canonicalJid = inputJid;
+      if (!canonicalJid) {
+        throw new Error(`Número não encontrado no WhatsApp: ${candidates.join(" / ")}`);
+      }
+    }
+
+    // ----- Monta o payload de mídia para o Baileys -----
+    const mediaContent = { url: String(mediaUrl) };
+    let payload;
+    if (type === "image") {
+      payload = { image: mediaContent, caption: caption ? String(caption) : undefined };
+    } else if (type === "video") {
+      payload = { video: mediaContent, caption: caption ? String(caption) : undefined };
+    } else if (type === "audio") {
+      payload = { audio: mediaContent, mimetype: "audio/ogg; codecs=opus", ptt: true };
+    } else {
+      payload = {
+        document: mediaContent,
+        fileName: fileName ? String(fileName) : "arquivo",
+        caption: caption ? String(caption) : undefined,
+      };
+    }
+
+    let sent;
+    try {
+      sent = await session.socket.sendMessage(canonicalJid, payload);
+    } catch (err) {
+      console.log(`⚠️ [${id}] sendMessage(media) falhou para ${canonicalJid}: ${err.message}`);
+      throw new Error(`Falha ao enviar mídia para ${canonicalJid}: ${err.message}`);
+    }
+
+    const delivered = !!sent?.key?.id;
+    if (!delivered) throw new Error("Envio de mídia não confirmado (sem messageId)");
+
+    console.log(`📤 [${id}] → ${canonicalJid} (${type}): ${String(mediaUrl).slice(0, 80)}`);
+    return {
+      success: true,
+      delivered: true,
+      messageId: sent.key.id,
+      to: canonicalJid,
+      mediaType: type,
+      isGroup: isGroupJid,
+      resolvedFrom: resolvedFrom || undefined,
+    };
+  }
+
   setWebhook(id, url) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
@@ -1127,7 +1226,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.10" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.11" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -1257,6 +1356,34 @@ app.post("/send", requireInstance, async (req, res) => {
   } catch (err) {
     // Erros de envio retornam 400 (cliente) — não 200 vazio
     const msg = err.message || "send failed";
+    const status = /not connected|Session not found/i.test(msg) ? 409 : 400;
+    res.status(status).json({ success: false, error: msg });
+  }
+});
+
+// ─── POST /send-media (v2.11) ─────────────────────────────────────────────
+// Payload: { phone|jid|to|group_jid, mediaUrl, caption?, mediaType?, fileName? }
+// mediaType: image (default) | video | audio | document
+app.post("/send-media", requireInstance, async (req, res) => {
+  try {
+    const body = req.body || {};
+    const recipient = body.group_jid || body.jid || body.to || body.phone;
+    const mediaUrl = body.mediaUrl || body.media_url || body.url;
+    const caption = body.caption || "";
+    const mediaType = body.mediaType || body.media_type || "image";
+    const fileName = body.fileName || body.file_name || body.filename;
+
+    if (!recipient) {
+      return res.status(400).json({ success: false, error: "Missing recipient (phone | jid | to | group_jid)" });
+    }
+    if (!mediaUrl) {
+      return res.status(400).json({ success: false, error: "Missing mediaUrl" });
+    }
+
+    const result = await sessions.sendMedia(req.session.id, recipient, mediaUrl, caption, mediaType, fileName);
+    res.json(result);
+  } catch (err) {
+    const msg = err.message || "send-media failed";
     const status = /not connected|Session not found/i.test(msg) ? 409 : 400;
     res.status(status).json({ success: false, error: msg });
   }
