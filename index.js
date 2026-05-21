@@ -1175,6 +1175,134 @@ class SessionManager {
     return Array.from(session.contacts.values());
   }
 
+  // ─── v2.12: Listagem de grupos para apps externos (Ponte API) ───
+  // Usa o cache de groupFetchAllParticipating já mantido por listChats (TTL 60s + circuit-breaker).
+  async listGroups(id) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    if (session.status !== "connected" || !session.socket) {
+      throw new Error("Instance not connected");
+    }
+    const sock = session.socket;
+    const now = Date.now();
+    const GROUPS_CACHE_TTL_MS = 60 * 1000;
+    const GROUPS_COOLDOWN_MS = 120 * 1000;
+
+    // Reaproveita cache se fresco; senão dispara fetch com single-flight + cooldown.
+    let groupsMap;
+    const cacheFresh = session.groupsCache && (now - session.groupsCacheAt) < GROUPS_CACHE_TTL_MS;
+    const inCooldown = now < session.groupsCooldownUntil;
+    if (cacheFresh) {
+      groupsMap = session.groupsCache;
+    } else if (inCooldown) {
+      groupsMap = session.groupsCache || {};
+    } else {
+      if (!session.groupsInflight) {
+        session.groupsInflight = (async () => {
+          try {
+            const fresh = await sock.groupFetchAllParticipating();
+            session.groupsCache = fresh;
+            session.groupsCacheAt = Date.now();
+            return fresh;
+          } catch (err) {
+            const msg = err?.message || String(err);
+            if (/rate-overlimit|rate.?limit/i.test(msg)) {
+              session.groupsCooldownUntil = Date.now() + GROUPS_COOLDOWN_MS;
+              console.log(`⚠️ [${id}] listGroups: rate-overlimit — cooldown ${GROUPS_COOLDOWN_MS/1000}s`);
+            } else {
+              console.log(`⚠️ [${id}] groupFetchAllParticipating falhou: ${msg}`);
+            }
+            return session.groupsCache || {};
+          } finally {
+            session.groupsInflight = null;
+          }
+        })();
+      }
+      groupsMap = await session.groupsInflight;
+    }
+
+    const numOnly = (jid) => (jid && typeof jid === "string") ? jid.split("@")[0].split(":")[0].replace(/\D/g, "") : "";
+    const meSet = new Set();
+    if (sock.user?.id) meSet.add(numOnly(sock.user.id));
+    if (sock.user?.lid) meSet.add(numOnly(sock.user.lid));
+    if (session.phone) meSet.add(numOnly(session.phone));
+
+    const groups = Object.values(groupsMap).map((g) => {
+      const participants = g.participants || [];
+      const meEntry = participants.find((p) => {
+        const candidates = [p.id, p.jid, p.lid].filter(Boolean).map(numOnly);
+        return candidates.some((c) => c && meSet.has(c));
+      });
+      const adminFlag = meEntry?.admin;
+      const isAdmin = !!(meEntry && (adminFlag === "admin" || adminFlag === "superadmin"));
+      return {
+        id: g.id,
+        subject: g.subject || null,
+        size: participants.length,
+        owner: g.owner || null,
+        creation: g.creation || null,
+        desc: g.desc || null,
+        is_announcement: !!(g.announce ?? g.announcement ?? g.restrict),
+        is_admin: isAdmin,
+      };
+    });
+    return { count: groups.length, groups };
+  }
+
+  // Metadados completos de UM grupo. Aceita JID com @g.us.
+  // Tenta resolver número real mesmo quando participante vem como @lid.
+  async getGroupParticipants(id, groupJid) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+    if (session.status !== "connected" || !session.socket) {
+      throw new Error("Instance not connected");
+    }
+    if (!groupJid || !groupJid.endsWith("@g.us")) {
+      throw new Error("Invalid group_jid (must end with @g.us)");
+    }
+    const sock = session.socket;
+    const meta = await sock.groupMetadata(groupJid);
+
+    const numOnly = (jid) => (jid && typeof jid === "string") ? jid.split("@")[0].split(":")[0].replace(/\D/g, "") : "";
+
+    const participants = (meta.participants || []).map((p) => {
+      const rawId = p.id || "";
+      const rawLid = p.lid || "";
+      const isLidOnly = rawId.endsWith("@lid");
+      // Para participantes com domínio @s.whatsapp.net, o número é direto.
+      // Para @lid, tentamos achar o número real via cache de contatos da sessão.
+      let phone_e164 = null;
+      if (rawId.endsWith("@s.whatsapp.net")) {
+        phone_e164 = numOnly(rawId);
+      } else if (rawLid && rawLid.endsWith("@s.whatsapp.net")) {
+        phone_e164 = numOnly(rawLid);
+      } else {
+        // Tenta resolver via contatos conhecidos (alguns chegam com pushName + número real)
+        const contactByLid = session.contacts.get(rawId);
+        if (contactByLid?.id?.endsWith("@s.whatsapp.net")) {
+          phone_e164 = numOnly(contactByLid.id);
+        }
+      }
+      return {
+        id: rawId,
+        lid: rawLid || null,
+        admin: p.admin || null,
+        phone_e164,
+        lid_only: isLidOnly && !phone_e164,
+      };
+    });
+
+    return {
+      id: meta.id,
+      subject: meta.subject || null,
+      owner: meta.owner || null,
+      creation: meta.creation || null,
+      desc: meta.desc || null,
+      size: participants.length,
+      participants,
+    };
+  }
+
   listAll() {
     return Array.from(this.sessions.values()).map((s) => ({
       id: s.id,
@@ -1226,7 +1354,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.11" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.12" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -1335,6 +1463,38 @@ app.get("/contacts", requireInstance, (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// GET /groups — lista grupos da instância (v2.12). Resposta: { count, groups: [...] }
+// Cache 60s + single-flight (proteção contra rate-limit do WhatsApp).
+app.get("/groups", requireInstance, async (req, res) => {
+  try {
+    const result = await sessions.listGroups(req.session.id);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    const msg = err.message || "listGroups failed";
+    const status = /not connected|Session not found/i.test(msg) ? 409 : 500;
+    res.status(status).json({ success: false, error: msg });
+  }
+});
+
+// GET /groups/:jid/participants — metadados completos de UM grupo (v2.12).
+// Resposta: { id, subject, owner, creation, desc, size, participants: [...] }
+// Cada participante traz { id, lid, admin, phone_e164, lid_only }.
+// IMPORTANTE: throttle ~400ms se o cliente chamar em loop (proteção anti-ban).
+app.get("/groups/:jid/participants", requireInstance, async (req, res) => {
+  try {
+    const jid = decodeURIComponent(req.params.jid);
+    const result = await sessions.getGroupParticipants(req.session.id, jid);
+    // Pequeno delay para desencorajar varreduras agressivas
+    await new Promise((r) => setTimeout(r, 400));
+    res.json({ success: true, ...result });
+  } catch (err) {
+    const msg = err.message || "groupMetadata failed";
+    const status = /not connected|Session not found|Invalid group_jid/i.test(msg) ? 400 : 500;
+    res.status(status).json({ success: false, error: msg });
+  }
+});
+
 
 app.post("/send", requireInstance, async (req, res) => {
   try {
