@@ -15,6 +15,12 @@
 //   - Single-flight: chamadas concorrentes compartilham a mesma Promise
 //   - Circuit-breaker: 120s de cooldown servindo cache após rate-overlimit
 //   - Reduz pressão no servidor do WhatsApp e protege o número de bloqueios
+// v2.13 — Segurança anti-ban (jun/2026):
+//   - syncFullHistory: false (era true) — não puxa mais histórico completo a
+//     cada reconexão, que era rajada gigante de tráfego WS suspeita ao WhatsApp
+//   - Backoff de reconexão muito mais lento (30s/2min/10min/30min/1h) com
+//     teto de 5 tentativas por sessão. Acima disso, exige reconexão manual.
+//   - Motivação: número sensibilizado + loops de reconexão = ban silencioso
 // v2.6 — Sincronização completa de contatos (nomes da agenda do celular):
 //   - syncFullHistory: true para Baileys puxar a lista completa de contatos
 //   - Resolve o caso "chat aparece só com número" mesmo com contato salvo
@@ -386,7 +392,7 @@ class SessionManager {
       // Sincroniza histórico recente (chats e mensagens) ao conectar para
       // popular as stores de chats/messages/contacts. Não puxa histórico completo.
       shouldSyncHistoryMessage: () => true,
-      syncFullHistory: true, // v2.6: necessário para Baileys puxar lista completa de contatos do WhatsApp (nomes da agenda)
+      syncFullHistory: false, // v2.13: DESLIGADO. Evita rajada de histórico completo a cada reconexão (gatilho de ban). Use /contacts sob demanda.
     });
 
     session.socket = socket;
@@ -662,18 +668,31 @@ class SessionManager {
 
         const shouldReconnect = this._decideReconnect(code, reason);
 
+        // v2.13: backoff bem mais lento + teto de 5 tentativas por sessão.
+        // Reconexões frequentes em curto intervalo são um dos principais
+        // gatilhos de banimento. Preferimos parar e exigir reconexão manual
+        // (novo QR) a entupir a sessão do WhatsApp com tentativas.
+        const MAX_RECONNECT_ATTEMPTS = 5;
+        const RECONNECT_DELAYS_MS = [30_000, 120_000, 600_000, 1_800_000, 3_600_000]; // 30s, 2min, 10min, 30min, 1h
         if (shouldReconnect) {
           const attempts = (this.reconnectAttempts.get(id) || 0) + 1;
           this.reconnectAttempts.set(id, attempts);
-          const delay = Math.min(3000 * Math.pow(2, attempts - 1), 60000);
-          console.log(`🔄 [${id}] Tentativa #${attempts} em ${delay}ms...`);
-          const timer = setTimeout(() => {
-            this.reconnectTimers.delete(id);
-            this.connect(id).catch((err) =>
-              console.log(`⚠️ [${id}] Reconexão falhou: ${err.message}`)
-            );
-          }, delay);
-          this.reconnectTimers.set(id, timer);
+          if (attempts > MAX_RECONNECT_ATTEMPTS) {
+            console.log(`⛔ [${id}] Limite de ${MAX_RECONNECT_ATTEMPTS} tentativas atingido. Pare automática. Reconecte manualmente.`);
+            session.status = "disconnected";
+            session.lastDisconnectReason = `max_reconnect_attempts_reached (${attempts})`;
+            this._clearReconnectTimer(id);
+          } else {
+            const delay = RECONNECT_DELAYS_MS[attempts - 1] || 3_600_000;
+            console.log(`🔄 [${id}] Tentativa #${attempts}/${MAX_RECONNECT_ATTEMPTS} em ${Math.round(delay/1000)}s...`);
+            const timer = setTimeout(() => {
+              this.reconnectTimers.delete(id);
+              this.connect(id).catch((err) =>
+                console.log(`⚠️ [${id}] Reconexão falhou: ${err.message}`)
+              );
+            }, delay);
+            this.reconnectTimers.set(id, timer);
+          }
         } else {
           console.log(`⛔ [${id}] Reconexão automática desabilitada (${code})`);
         }
@@ -1354,7 +1373,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.12" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: "2.13" }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
