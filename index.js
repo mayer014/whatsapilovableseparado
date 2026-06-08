@@ -1,7 +1,15 @@
 
 // ============================================================================
-// WhatsHub Engine v2.10 - Motor Baileys + Resolução canônica de JID (onWhatsApp)
+// WhatsHub Engine v2.14 - Motor Baileys + boot seguro anti-reconexão fantasma
 // ----------------------------------------------------------------------------
+// v2.14 — Boot seguro anti-ban:
+//   • NÃO reconecta sessões persistidas automaticamente no restart por padrão.
+//   • Sessões com creds.json ficam restauradas em memória, aguardando /connect manual.
+//   • AUTO_RECONNECT_ON_BOOT=true reativa boot reconnect, idealmente com allowlist.
+//   • AUTO_RECONNECT_AFTER_CLOSE=true reativa reconexão após queda; padrão é manual.
+//   • /connect é idempotente: não cria múltiplos sockets para a mesma sessão.
+//   • 401/loggedOut/connection failure nunca entra em loop automático.
+//
 // v2.10 — Resolução canônica de JID antes do envio 1:1:
 //   • Antes do send, chama sock.onWhatsApp([numero, variante BR]) para descobrir o JID real.
 //   • Se nenhum candidato existir → erro 404 ("Número não encontrado no WhatsApp")
@@ -60,6 +68,29 @@ const SESSIONS_DIR =
 // URL pública do motor — usada para montar mediaUrl absoluto no webhook
 // Ex.: https://motor.seudominio.com (sem barra no final)
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
+const ENGINE_VERSION = "2.14";
+
+// ─── Guardas anti-ban de reconexão ─────────────────────────────────────────
+// Padrão seguro: restart do container NÃO deve abrir dezenas de WebSockets
+// para sessões antigas/órfãs. A sessão fica disponível em /instance/list e
+// só reconecta quando alguém chamar /connect manualmente.
+const AUTO_RECONNECT_ON_BOOT = process.env.AUTO_RECONNECT_ON_BOOT === "true";
+const AUTO_RECONNECT_AFTER_CLOSE = process.env.AUTO_RECONNECT_AFTER_CLOSE === "true";
+const BOOT_RECONNECT_INSTANCE_IDS = new Set(
+  String(process.env.BOOT_RECONNECT_INSTANCE_IDS || "")
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean)
+);
+
+function canAutoReconnectOnBoot(id) {
+  if (!AUTO_RECONNECT_ON_BOOT) return false;
+  return BOOT_RECONNECT_INSTANCE_IDS.size === 0 || BOOT_RECONNECT_INSTANCE_IDS.has(id);
+}
+
+function hasPersistedCreds(id) {
+  return fs.existsSync(path.join(SESSIONS_DIR, id, "creds.json"));
+}
 
 if (!fs.existsSync(SESSIONS_DIR)) {
   fs.mkdirSync(SESSIONS_DIR, { recursive: true });
@@ -219,6 +250,7 @@ class SessionManager {
     this.sessions = new Map();
     this.reconnectAttempts = new Map();
     this.reconnectTimers = new Map();
+    this.connectingPromises = new Map();
   }
 
   getByToken(token) {
@@ -314,6 +346,10 @@ class SessionManager {
         session.contacts = new Map();
         session.messagesByJid = new Map();
         session.messageIndex = new Map();
+        session.groupsCache = null;
+        session.groupsCacheAt = 0;
+        session.groupsCooldownUntil = 0;
+        session.groupsInflight = null;
 
         // v2.8: replay do messages.jsonl para popular messageIndex e
         // messagesByJid antes mesmo do socket reconectar. Garante que
@@ -335,10 +371,15 @@ class SessionManager {
         }
 
         if (fs.existsSync(credsPath)) {
-          console.log(`   → Reconectando ${id}...`);
-          this.connect(id).catch((err) =>
-            console.log(`   ⚠️ Falha ao reconectar ${id}: ${err.message}`)
-          );
+          if (canAutoReconnectOnBoot(id)) {
+            console.log(`   → ${id} com credenciais, auto-reconnect de boot autorizado...`);
+            this.connect(id, { reason: "boot" }).catch((err) =>
+              console.log(`   ⚠️ Falha ao reconectar ${id}: ${err.message}`)
+            );
+          } else {
+            session.lastDisconnectReason = "restored_from_disk_waiting_manual_connect";
+            console.log(`   🛡️ ${id} com credenciais restauradas; aguardando /connect manual (AUTO_RECONNECT_ON_BOOT=false)`);
+          }
         } else {
           console.log(`   → ${id} sem credenciais, aguardando QR`);
         }
@@ -349,6 +390,12 @@ class SessionManager {
   }
 
   _decideReconnect(code, reason = "") {
+    const text = String(reason || "").toLowerCase();
+
+    // Padrão seguro v2.14: reconexão automática após queda fica desligada.
+    // Reative só se aceitar o risco: AUTO_RECONNECT_AFTER_CLOSE=true.
+    if (!AUTO_RECONNECT_AFTER_CLOSE) return false;
+
     const manual = [
       DisconnectReason.loggedOut,
       DisconnectReason.connectionReplaced,
@@ -356,8 +403,11 @@ class SessionManager {
       DisconnectReason.multideviceMismatch,
       DisconnectReason.timedOut,
     ];
-    const text = String(reason || "").toLowerCase();
-    if (manual.includes(code)) return false;
+
+    // 401/loggedOut/connection failure indica sessão inválida, banida,
+    // substituída ou desconectada pelo WhatsApp. Tentar de novo só piora.
+    if (manual.includes(code) || code === 401) return false;
+    if (text.includes("logged out") || text.includes("connection failure")) return false;
     if (text.includes("qr refs attempts ended") || text.includes("qr") || code === 408) return false;
     return true;
   }
@@ -368,7 +418,31 @@ class SessionManager {
     this.reconnectTimers.delete(id);
   }
 
-  async connect(id) {
+  async connect(id, opts = {}) {
+    const session = this.sessions.get(id);
+    if (!session) throw new Error("Session not found");
+
+    if (session.status === "connected" && session.socket) {
+      return { id, status: "connected", reused: true };
+    }
+
+    if (session.status === "connecting" && session.socket) {
+      return { id, status: "connecting", reused: true, qrcode: session.qrcode };
+    }
+
+    const inFlight = this.connectingPromises.get(id);
+    if (inFlight) return inFlight;
+
+    const promise = this._connectFresh(id, opts);
+    this.connectingPromises.set(id, promise);
+    try {
+      return await promise;
+    } finally {
+      this.connectingPromises.delete(id);
+    }
+  }
+
+  async _connectFresh(id, opts = {}) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
 
@@ -694,12 +768,14 @@ class SessionManager {
             this.reconnectTimers.set(id, timer);
           }
         } else {
+          session.status = "disconnected";
+          this._clearReconnectTimer(id);
           console.log(`⛔ [${id}] Reconexão automática desabilitada (${code})`);
         }
       }
     });
 
-    return { id };
+    return { id, status: session.status, reason: opts.reason || "manual" };
   }
 
   async disconnect(id) {
@@ -727,6 +803,7 @@ class SessionManager {
     this._clearReconnectTimer(id);
     this.sessions.delete(id);
     this.reconnectAttempts.delete(id);
+    this.connectingPromises.delete(id);
 
     const dir = path.join(SESSIONS_DIR, id);
     if (fs.existsSync(dir)) {
@@ -1330,6 +1407,11 @@ class SessionManager {
       connected: s.status === "connected" && !!s.socket && !s.lastDisconnectReason,
       hasSocket: !!s.socket,
       webhook: s.webhook,
+      hasCreds: hasPersistedCreds(s.id),
+      reconnectAttempts: this.reconnectAttempts.get(s.id) || 0,
+      reconnectScheduled: this.reconnectTimers.has(s.id),
+      bootAutoReconnectEnabled: AUTO_RECONNECT_ON_BOOT,
+      closeAutoReconnectEnabled: AUTO_RECONNECT_AFTER_CLOSE,
       lastDisconnectReason: s.lastDisconnectReason,
       createdAt: s.createdAt,
     }));
@@ -1373,7 +1455,7 @@ function requireInstance(req, res, next) {
   next();
 }
 
-app.get("/health", (_, res) => res.json({ ok: true, version: "2.13" }));
+app.get("/health", (_, res) => res.json({ ok: true, version: ENGINE_VERSION }));
 
 app.get("/system/metrics", (_, res) => {
   const mem = process.memoryUsage();
@@ -1608,7 +1690,7 @@ app.get("/media/:messageId", requireInstance, async (req, res) => {
 });
 
 app.listen(PORT, async () => {
-  console.log(`🚀 WhatsHub Engine v2.10 online na porta ${PORT}`);
+  console.log(`🚀 WhatsHub Engine v${ENGINE_VERSION} online na porta ${PORT}`);
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
