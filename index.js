@@ -1,7 +1,13 @@
 
 // ============================================================================
-// WhatsHub Engine v2.14 - Motor Baileys + boot seguro anti-reconexão fantasma
+// WhatsHub Engine v2.15 - Motor Baileys + correção do pareamento via QR Code
 // ----------------------------------------------------------------------------
+// v2.15 — Correção crítica do pareamento (515 restartRequired):
+//   • Após ler o QR Code, o WhatsApp SEMPRE fecha a conexão com código 515
+//     (restartRequired) e exige UMA reconexão imediata para concluir o pareamento.
+//   • O v2.14 bloqueava essa reconexão obrigatória, então o celular ficava
+//     "carregando" e nunca conectava. Agora o 515 reconecta imediatamente,
+//     uma única vez, sem depender de AUTO_RECONNECT_AFTER_CLOSE.
 // v2.14 — Boot seguro anti-ban:
 //   • NÃO reconecta sessões persistidas automaticamente no restart por padrão.
 //   • Sessões com creds.json ficam restauradas em memória, aguardando /connect manual.
@@ -68,7 +74,7 @@ const SESSIONS_DIR =
 // URL pública do motor — usada para montar mediaUrl absoluto no webhook
 // Ex.: https://motor.seudominio.com (sem barra no final)
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
-const ENGINE_VERSION = "2.14";
+const ENGINE_VERSION = "2.15";
 
 // ─── Guardas anti-ban de reconexão ─────────────────────────────────────────
 // Padrão seguro: restart do container NÃO deve abrir dezenas de WebSockets
@@ -391,6 +397,12 @@ class SessionManager {
 
   _decideReconnect(code, reason = "") {
     const text = String(reason || "").toLowerCase();
+
+    // v2.15: 515 (restartRequired) é parte NORMAL do pareamento via QR Code.
+    // O WhatsApp fecha a conexão logo após a leitura do QR e exige uma
+    // reconexão imediata para concluir o login. Não é loop nem risco de ban:
+    // é uma reconexão única e obrigatória. Sempre permitida.
+    if (code === DisconnectReason.restartRequired || code === 515) return true;
 
     // Padrão seguro v2.14: reconexão automática após queda fica desligada.
     // Reative só se aceitar o risco: AUTO_RECONNECT_AFTER_CLOSE=true.
@@ -741,6 +753,7 @@ class SessionManager {
         console.log(`🔌 [${id}] Desconectado (${code}): ${reason}`);
 
         const shouldReconnect = this._decideReconnect(code, reason);
+        const isPairingRestart = code === DisconnectReason.restartRequired || code === 515;
 
         // v2.13: backoff bem mais lento + teto de 5 tentativas por sessão.
         // Reconexões frequentes em curto intervalo são um dos principais
@@ -748,7 +761,17 @@ class SessionManager {
         // (novo QR) a entupir a sessão do WhatsApp com tentativas.
         const MAX_RECONNECT_ATTEMPTS = 5;
         const RECONNECT_DELAYS_MS = [30_000, 120_000, 600_000, 1_800_000, 3_600_000]; // 30s, 2min, 10min, 30min, 1h
-        if (shouldReconnect) {
+        if (isPairingRestart) {
+          // v2.15: reconexão imediata e única para concluir o pareamento.
+          // Sem backoff e sem contar como tentativa de reconexão.
+          console.log(`🔁 [${id}] Restart de pareamento (515) — reconectando imediatamente para concluir o login...`);
+          session.status = "connecting";
+          setTimeout(() => {
+            this.connect(id).catch((err) =>
+              console.log(`⚠️ [${id}] Falha ao concluir pareamento: ${err.message}`)
+            );
+          }, 1_000);
+        } else if (shouldReconnect) {
           const attempts = (this.reconnectAttempts.get(id) || 0) + 1;
           this.reconnectAttempts.set(id, attempts);
           if (attempts > MAX_RECONNECT_ATTEMPTS) {
