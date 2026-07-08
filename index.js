@@ -1,7 +1,17 @@
 
 // ============================================================================
-// WhatsHub Engine v2.15 - Motor Baileys + correção do pareamento via QR Code
+// WhatsHub Engine v2.16 - Auto-reconexao segura pos-queda (default ON)
 // ----------------------------------------------------------------------------
+// v2.16 — Auto-reconexao pos-queda ligada por padrao (protegida contra ban):
+//   - AUTO_RECONNECT_AFTER_CLOSE agora e TRUE por padrao (so desliga com "false").
+//   - Motivos "seguros" ja sao bloqueados por _decideReconnect: loggedOut,
+//     connectionReplaced, badSession, multideviceMismatch, timedOut, 401,
+//     "logged out", "connection failure", "qr refs attempts ended" NUNCA
+//     entram em reconexao automatica (evita loops de ban).
+//   - Motivos transientes (rede caiu, timeout curto) voltam a se auto-curar
+//     sem exigir novo QR a cada blip.
+//   - Backoff de 30s/2min/10min/30min/1h + teto de 5 tentativas continua ativo.
+//
 // v2.15 — Correção crítica do pareamento (515 restartRequired):
 //   • Após ler o QR Code, o WhatsApp SEMPRE fecha a conexão com código 515
 //     (restartRequired) e exige UMA reconexão imediata para concluir o pareamento.
@@ -74,14 +84,14 @@ const SESSIONS_DIR =
 // URL pública do motor — usada para montar mediaUrl absoluto no webhook
 // Ex.: https://motor.seudominio.com (sem barra no final)
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
-const ENGINE_VERSION = "2.15";
+const ENGINE_VERSION = "2.16";
 
 // ─── Guardas anti-ban de reconexão ─────────────────────────────────────────
 // Padrão seguro: restart do container NÃO deve abrir dezenas de WebSockets
 // para sessões antigas/órfãs. A sessão fica disponível em /instance/list e
 // só reconecta quando alguém chamar /connect manualmente.
 const AUTO_RECONNECT_ON_BOOT = process.env.AUTO_RECONNECT_ON_BOOT === "true";
-const AUTO_RECONNECT_AFTER_CLOSE = process.env.AUTO_RECONNECT_AFTER_CLOSE === "true";
+const AUTO_RECONNECT_AFTER_CLOSE = process.env.AUTO_RECONNECT_AFTER_CLOSE !== "false"; // v2.16: default TRUE (guardado por _decideReconnect)
 const BOOT_RECONNECT_INSTANCE_IDS = new Set(
   String(process.env.BOOT_RECONNECT_INSTANCE_IDS || "")
     .split(",")
