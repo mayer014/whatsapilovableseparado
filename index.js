@@ -1,7 +1,13 @@
 
 // ============================================================================
-// WhatsHub Engine v2.16 - Auto-reconexao segura pos-queda (default ON)
+// WhatsHub Engine v2.17 - status recuperavel e diagnostico de credenciais
 // ----------------------------------------------------------------------------
+// v2.17 — Status recuperavel e diagnostico de credenciais:
+//   - /status e /instance/list expõem hasCreds, canRecover, reconnectAttempts
+//     e statusReason para a Bridge não tratar queda transitória como logout.
+//   - restored_from_disk_waiting_manual_connect vira estado recuperável: basta /connect
+//     no mesmo token; não exige QR nem recriação de sessão.
+//
 // v2.16 — Auto-reconexao pos-queda ligada por padrao (protegida contra ban):
 //   - AUTO_RECONNECT_AFTER_CLOSE agora e TRUE por padrao (so desliga com "false").
 //   - Motivos "seguros" ja sao bloqueados por _decideReconnect: loggedOut,
@@ -84,7 +90,7 @@ const SESSIONS_DIR =
 // URL pública do motor — usada para montar mediaUrl absoluto no webhook
 // Ex.: https://motor.seudominio.com (sem barra no final)
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/$/, "");
-const ENGINE_VERSION = "2.16";
+const ENGINE_VERSION = "2.17";
 
 // ─── Guardas anti-ban de reconexão ─────────────────────────────────────────
 // Padrão seguro: restart do container NÃO deve abrir dezenas de WebSockets
@@ -462,6 +468,27 @@ class SessionManager {
     } finally {
       this.connectingPromises.delete(id);
     }
+  }
+
+  _statusReason(session) {
+    if (!session) return "session_missing";
+    if (session.status === "connected") return "connected";
+    if (session.qrcode) return "qr_available";
+    return session.lastDisconnectReason || session.status || "unknown";
+  }
+
+  _canRecover(session) {
+    if (!session) return false;
+    const reason = String(session.lastDisconnectReason || "").toLowerCase();
+    const terminal = [
+      "logged out", "loggedout", "logged_out", "logout",
+      "bad session", "badsession", "bad_session",
+      "creds_missing", "no_credentials", "session_missing",
+      "connection replaced", "connectionreplaced",
+      "multidevice", "multi_device", "401", "unauthorized",
+      "qr code expirado", "qr refs attempts ended",
+    ].some((marker) => reason.includes(marker));
+    return hasPersistedCreds(session.id) && !terminal;
   }
 
   async _connectFresh(id, opts = {}) {
@@ -880,11 +907,19 @@ class SessionManager {
   status(id) {
     const session = this.sessions.get(id);
     if (!session) throw new Error("Session not found");
+    const hasCreds = hasPersistedCreds(session.id);
+    const canRecover = this._canRecover(session);
+    const statusReason = this._statusReason(session);
     return {
       id: session.id,
       status: session.status,
       qrcode: session.qrcode,
       phone: session.phone,
+      hasCreds,
+      canRecover,
+      credentialsRestored: hasCreds,
+      reconnectAttempts: this.reconnectAttempts.get(id) || 0,
+      statusReason,
       lastDisconnectReason: session.lastDisconnectReason,
     };
   }
@@ -1727,3 +1762,4 @@ app.listen(PORT, async () => {
   console.log(`📁 Sessões em: ${SESSIONS_DIR}`);
   await sessions.recoverPersistedSessions();
 });
+
